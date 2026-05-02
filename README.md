@@ -3,6 +3,8 @@
 18\. Uluslararası MEB Robot Yarışması, Otonom Araç kategorisi için geliştirilmiş proje.
 Araç, kamera görüntüsünden şerit takibi yapar; tabelaları ve trafik ışıklarını tanıyarak görevleri tamamlar.
 
+**Donanım:** Raspberry Pi 4 (beyin) + L298N motor sürücüsü + Pi Camera/USB kamera + servo direksiyon.
+
 ---
 
 ## Dosyalar
@@ -35,9 +37,15 @@ pip install -r requirements.txt
 
 ## Çalıştırma
 
-### Yarışma modu (Raspberry Pi / Jetson)
+### Yarışma modu (Raspberry Pi 4)
 ```bash
-python main.py
+# Tek seferlik: Pi 4 için modeli NCNN'e dönüştür (5-8× hızlanma!)
+yolo export model=best.pt format=ncnn imgsz=320
+
+# Sonra ROS2 node'larını başlat
+source /opt/ros/humble/setup.bash
+python3 ros2_beyin_yayin.py     # Terminal 1
+python3 ros2_motor_dinleyici.py  # Terminal 2
 ```
 
 ### MacBook simülasyonu (motor sinyali yok)

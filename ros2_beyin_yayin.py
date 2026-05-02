@@ -2,87 +2,104 @@
 ros2_beyin_yayin.py
 MEB Otonom Araç — ROS2 Yayıncı (Publisher) Node'u
 
-Bu node kameradan gelen görüntüyü YOLOv8 ile işler ve aldığı kararları
-ROS2 topic'leri üzerinden yayınlar. Motora doğrudan bağlantı YOKTUR;
-ayrı bir abone (subscriber) node motor sürücüsünü yönetir.
+Kameradan gelen görüntüyü YOLOv8 ile işler ve aldığı kararları
+ROS2 topic'leri üzerinden yayınlar. Motora doğrudan bağlantı YOKTUR.
 
-Jetson üzerinde çalıştırmak için:
-    source /opt/ros/humble/setup.bash        # ROS2 ortamını aktifleştir
+Son review iyileştirmeleri:
+  • Kamera capture ayrı thread'de  → ROS2 executor bloklanmaz
+  • Temporal kararlılık filtresi   → tek-kare false positive'lere geçit yok
+  • Heartbeat publisher (5Hz)      → motor watchdog'u beyin ölünce frene basar
+  • MultiThreadedExecutor          → timer + heartbeat paralel çalışır
+  • QoS: komut Reliable, sapma BestEffort/depth=1 (latest-wins)
+  • Magic string'ler komutlar.py'den (typo riski yok)
+  • Jetson CSI için isteğe bağlı GStreamer pipeline
+
+Çalıştırma:
+    source /opt/ros/humble/setup.bash
     python3 ros2_beyin_yayin.py
 
 ──────────────────────────────────────────────────────────────────────────────
-  TOPIC MİMARİSİ  (Alara için: hangi topic'ler var, ne işe yarıyor?)
+  TOPIC MİMARİSİ  (Alara için)
 ──────────────────────────────────────────────────────────────────────────────
 
-  BU NODE YAYINLAR (Publisher):
-  ┌─────────────────┬───────────────────┬──────────────────────────────────┐
-  │ Topic adı       │ Mesaj tipi        │ Ne zaman / ne içeriyor?          │
-  ├─────────────────┼───────────────────┼──────────────────────────────────┤
-  │ /arac_komut     │ std_msgs/String   │ Tabela/ışık kararları (aşağıda) │
-  │ /serit_sapma    │ std_msgs/String   │ Her karede "SAPMA:XX" (şerit)   │
-  └─────────────────┴───────────────────┴──────────────────────────────────┘
+  YAYINLAR:
+    /arac_komut    String   Yüksek seviye karar komutları (DUR, HIZ:40, ...)
+    /serit_sapma   String   "SAPMA:XX" — şerit takibi sapması
+    /beyin_kalp    String   "KALP" — saniyede 5 kez heartbeat (watchdog için)
 
-  /arac_komut mesaj listesi:
-    "YESIL_ISIK"        → Trafik ışığı yeşile döndü, yarışma başlıyor
-    "DUR"               → Yaya/hemzemin tabelası görüldü, motorlar dur
-    "BEKLEME_BITTI"     → 5 saniyelik bekleme bitti, tekrar hareket et
-    "HIZ:20"            → Hız tümseği — yavaş geç
-    "HIZ:40"            → Normal hız — şerit takibine devam
-    "SOLLAMA"           → Sollama serbest tabelası — sol şerit manevrası
-    "SAGA_DON"          → Çıkmaz yol tabelası — sağa dönüş yap
-    "PARK_TABELASI"     → Park tabelası görüldü — kırmızı alan aranıyor
-    "PARK_ET"           → Kırmızı park alanı bulundu — park et, bitiş
-
-  BAŞKA NODE'LARIN DİNLEMESİ GEREKEN TOPIC'LER:
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │  Motor Sürücü Node'u şunları dinlemeli:                             │
-  │    /arac_komut  → komuta göre motorları kontrol et                  │
-  │    /serit_sapma → sapma değerine göre direksiyonu ayarla            │
-  │                                                                      │
-  │  İsteğe bağlı — Debug / Kayıt Node'u:                              │
-  │    /arac_komut  → aldığı komutları log dosyasına yaz                │
-  └──────────────────────────────────────────────────────────────────────┘
+  /arac_komut mesajları için → komutlar.py içindeki Komut sınıfı
 ──────────────────────────────────────────────────────────────────────────────
 """
 
 import sys
 import os
 import time
+import threading
+import queue
+from collections import deque
 
 import cv2
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, qos_profile_sensor_data
 from std_msgs.msg import String
 
 # Proje klasörünü import path'e ekle (Jetson'da farklı dizinden çalışırsa)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from nesne_beyni import (modeli_yukle, tahmin_yap,
-                          yesil_isik_var_mi, dur_komutu_var_mi, DURMA_SINIFLARI)
-from serit_beyni  import otonom_beyin
+                          yesil_isik_var_mi, dur_komutu_var_mi)
+from serit_beyni import otonom_beyin
+from komutlar import (Komut, Topic,
+                      HIZ_NORMAL, HIZ_YAVAS, HIZ_PARK, HIZ_DONUS, HIZ_SOLLAMA,
+                      KALP_HZ)
 
 # ── Ayarlar ────────────────────────────────────────────────────────────────
-MODEL_YOLU      = "best.pt"
-KAMERA_INDEX    = 0          # Jetson CSI kamera için /dev/video0 → index 0
-FRAME_GENISLIK  = 640
-FRAME_YUKSEKLIK = 480
-TABELA_COOLDOWN = 12         # Aynı tabelayı tekrar işleme almadan bekleme (sn)
-GORUNTU_GOSTER  = False      # Jetson'da monitör yoksa False yap (headless mod)
+KAMERA_INDEX     = 0
+FRAME_GENISLIK   = 640
+FRAME_YUKSEKLIK  = 480
+TABELA_COOLDOWN  = 12         # Aynı tabelayı tekrar işleme almadan bekleme (sn)
+GORUNTU_GOSTER   = False      # Jetson'da monitör yoksa False (headless)
+
+# Temporal kararlılık: son N frame'in en az M'sinde tabela görüldüyse kabul et
+KARARLI_PENCERE  = 5
+KARARLI_ESIK     = 3
+
+# ── Kamera pipeline seçimi ────────────────────────────────────────────────
+# Üç mod destekleniyor:
+#   1. USB kamera (V4L2)              → KAMERA_GSTREAMER = None  (default)
+#   2. Raspberry Pi Camera (libcamera)→ KAMERA_GSTREAMER = _PI_PIPELINE
+#   3. Jetson CSI (nvarguscamerasrc)  → KAMERA_GSTREAMER = _JETSON_PIPELINE
+
+# Pi 4 için libcamera tabanlı GStreamer pipeline (Pi Camera v2/v3/HQ).
+# NOT: Pi OS'ta `gstreamer1.0-libcamera` paketi kurulu olmalı:
+#   sudo apt install gstreamer1.0-libcamera
+_PI_PIPELINE = (
+    "libcamerasrc ! "
+    f"video/x-raw, width={FRAME_GENISLIK}, height={FRAME_YUKSEKLIK}, "
+    "framerate=30/1, format=BGR ! "
+    "appsink drop=1 max-buffers=1"
+)
+
+# Jetson CSI kamera (Xavier/Nano) — Pi4'te ÇALIŞMAZ, NVIDIA'ya özel
+_JETSON_PIPELINE = (
+    "nvarguscamerasrc ! "
+    f"video/x-raw(memory:NVMM), width={FRAME_GENISLIK*2}, height={FRAME_YUKSEKLIK*2}, "
+    "framerate=30/1 ! nvvidconv ! "
+    f"video/x-raw, width={FRAME_GENISLIK}, height={FRAME_YUKSEKLIK}, "
+    "format=BGRx ! videoconvert ! video/x-raw, format=BGR ! "
+    "appsink drop=1 max-buffers=1"
+)
+
+# Donanımına göre seç: Pi 4 + Pi Camera ise _PI_PIPELINE, USB ise None
+KAMERA_GSTREAMER: str | None = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROS2 Node sınıfı
-# ══════════════════════════════════════════════════════════════════════════════
-
 class AracBeyniNode(Node):
-    """
-    Kamera → YOLOv8 → ROS2 karar yayıncısı.
-
-    İç durum makinesi (state machine):
-        ISIK_BEKLE  : Trafik ışığı yeşile dönene kadar bekle (yarışma başlamadı)
-        NORMAL      : Şerit takibi + tabela tespiti aktif
-        DUR_BEKLE   : Yaya/hemzemin tabelası nedeniyle 5 sn bekleniyor
-    """
+    """Kamera → YOLOv8 → ROS2 karar yayıncısı."""
 
     ISIK_BEKLE = "ISIK_BEKLE"
     NORMAL     = "NORMAL"
@@ -91,177 +108,205 @@ class AracBeyniNode(Node):
     def __init__(self):
         super().__init__("arac_beyni")
 
+        # ── QoS profilleri ─────────────────────────────────────────────────
+        # Komut: Reliable + KeepLast — DUR komutu kaybolursa felaket olur
+        komut_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        # Sapma + heartbeat: BestEffort + depth=1 — en yenisi geçerli, eskiler atılır
+        sensor_qos = qos_profile_sensor_data
+
         # ── Publisher'lar ──────────────────────────────────────────────────
-        # queue_size=10: ağ gecikmesi olursa en fazla 10 mesaj bekletilir
-        self.komut_yay = self.create_publisher(String, "/arac_komut",  10)
-        self.sapma_yay = self.create_publisher(String, "/serit_sapma", 10)
+        self.komut_yay = self.create_publisher(String, Topic.ARAC_KOMUT,  komut_qos)
+        self.sapma_yay = self.create_publisher(String, Topic.SERIT_SAPMA, sensor_qos)
+        self.kalp_yay  = self.create_publisher(String, Topic.KALP_ATIS,   sensor_qos)
 
         # ── Kamera ────────────────────────────────────────────────────────
-        self.cap = cv2.VideoCapture(KAMERA_INDEX)
-        if not self.cap.isOpened():
-            self.get_logger().fatal(f"Kamera index={KAMERA_INDEX} açılamadı!")
-            raise RuntimeError("Kamera açılamadı")
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_GENISLIK)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_YUKSEKLIK)
+        if KAMERA_GSTREAMER:
+            self.cap = cv2.VideoCapture(KAMERA_GSTREAMER, cv2.CAP_GSTREAMER)
+            self.get_logger().info("Kamera: GStreamer pipeline (Jetson CSI)")
+        else:
+            self.cap = cv2.VideoCapture(KAMERA_INDEX)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_GENISLIK)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_YUKSEKLIK)
+            self.get_logger().info(f"Kamera: V4L2 index={KAMERA_INDEX}")
 
-        # ── YOLOv8 modeli ─────────────────────────────────────────────────
-        modeli_yukle(MODEL_YOLU)
+        if not self.cap.isOpened():
+            self.get_logger().fatal("Kamera açılamadı!")
+            raise RuntimeError("Kamera açılamadı")
+
+        # ── YOLOv8 modeli (best.engine varsa otomatik onu seçer) ──────────
+        modeli_yukle()
 
         # ── Durum makinesi değişkenleri ───────────────────────────────────
-        self.durum             = self.ISIK_BEKLE  # Başlangıç durumu
-        self.son_tabela_zamani = 0.0              # Cooldown başlangıcı
-        self.bekleme_bitis     = 0.0              # DUR_BEKLE bitiş zamanı
+        self.durum             = self.ISIK_BEKLE
+        self.son_tabela_zamani = 0.0
+        self.bekleme_bitis     = 0.0
 
-        # ── Ana döngü timer'ı: ~30 FPS ────────────────────────────────────
-        # ROS2'de time.sleep() KULLANILMAZ; bunun yerine timer callback kullanılır.
-        # 0.033 sn = ~30 kare/sn
-        self.timer = self.create_timer(0.033, self._kare_isle)
+        # ── Temporal kararlılık penceresi ─────────────────────────────────
+        # Son N frame'deki sınıf set'lerini tutar. _kararli() oy çokluğuna bakar.
+        self._tabela_gecmis: deque[set[str]] = deque(maxlen=KARARLI_PENCERE)
+
+        # ── Frame queue: capture thread → ana callback ────────────────────
+        self._frame_kuyrugu: queue.Queue = queue.Queue(maxsize=1)
+        self._kapaniyor      = threading.Event()
+        self._kamera_thread  = threading.Thread(target=self._kamera_dongusu, daemon=True)
+        self._kamera_thread.start()
+
+        # ── Callback group: timer'lar paralel ─────────────────────────────
+        cb_group = ReentrantCallbackGroup()
+        self.timer      = self.create_timer(0.033, self._kare_isle, callback_group=cb_group)
+        self.kalp_timer = self.create_timer(1.0 / KALP_HZ, self._kalp_at, callback_group=cb_group)
 
         self.get_logger().info("━━━ AracBeyniNode başlatıldı ━━━")
-        self.get_logger().info(f"  Yayın: /arac_komut | /serit_sapma")
         self.get_logger().info(f"  Durum: {self.durum}")
 
-    # ── Yayın yardımcısı ──────────────────────────────────────────────────
+    # ── Kamera thread'i: en yeni frame'i tutar, eskileri at ────────────────
+    def _kamera_dongusu(self) -> None:
+        while not self._kapaniyor.is_set():
+            ret, frame = self.cap.read()
+            if not ret:
+                time.sleep(0.005)
+                continue
+            if self._frame_kuyrugu.full():
+                try:
+                    self._frame_kuyrugu.get_nowait()
+                except queue.Empty:
+                    pass
+            self._frame_kuyrugu.put(frame)
 
-    def _yayinla(self, topic_yay, mesaj: str) -> None:
-        """Seçilen topic'e mesaj yayınlar ve terminale loglar."""
+    # ── Heartbeat: motor watchdog'u bunu izler ─────────────────────────────
+    def _kalp_at(self) -> None:
         msg = String()
-        msg.data = mesaj
-        topic_yay.publish(msg)
-        # ROS2 logger: Jetson'da `ros2 topic echo /arac_komut` ile izlenebilir
+        msg.data = Komut.KALP
+        self.kalp_yay.publish(msg)
+
+    # ── Yayın yardımcısı ──────────────────────────────────────────────────
+    def _yayinla(self, topic_yay, mesaj: str) -> None:
+        m = String()
+        m.data = mesaj
+        topic_yay.publish(m)
         self.get_logger().info(f"[YAY] {topic_yay.topic_name} ← '{mesaj}'")
 
-    # ── Ana callback: her ~33ms'de bir çağrılır ───────────────────────────
+    # ── Temporal kararlılık kontrolü ──────────────────────────────────────
+    def _kararli(self, sinif: str) -> bool:
+        """Bu sınıf son KARARLI_PENCERE frame'in en az KARARLI_ESIK'inde göründü mü?"""
+        return sum(sinif in s for s in self._tabela_gecmis) >= KARARLI_ESIK
 
+    # ── Ana callback (33ms timer) ─────────────────────────────────────────
     def _kare_isle(self) -> None:
-        ret, frame = self.cap.read()
-        if not ret:
-            self.get_logger().warn("Kameradan kare alınamadı, atlanıyor.")
+        try:
+            frame = self._frame_kuyrugu.get_nowait()
+        except queue.Empty:
             return
 
-        frame  = cv2.resize(frame, (FRAME_GENISLIK, FRAME_YUKSEKLIK))
-        su_an  = time.time()
+        su_an = time.time()
 
-        # ── DURUM: DUR_BEKLE ──────────────────────────────────────────────
-        # 5 saniyelik zorunlu bekleme süresi dolana kadar hiçbir şey yapma.
-        # (Kılavuz 3.4.2 ve 3.4.4: araç en az 5 sn beklemeli)
+        # ── DUR_BEKLE: 5 sn zorunlu bekleme (Kılavuz 3.4.2 / 3.4.4) ───────
         if self.durum == self.DUR_BEKLE:
             if su_an < self.bekleme_bitis:
                 kalan = self.bekleme_bitis - su_an
-                self.get_logger().info(f"[BEKLEME] {kalan:.1f} sn kaldı...", throttle_duration_sec=1)
+                self.get_logger().info(
+                    f"[BEKLEME] {kalan:.1f} sn", throttle_duration_sec=1
+                )
                 if GORUNTU_GOSTER:
                     self._bekle_ekrani(frame, kalan)
                 return
-            else:
-                # Bekleme bitti → normal sürüşe dön
-                self._yayinla(self.komut_yay, "BEKLEME_BITTI")
-                self._yayinla(self.komut_yay, "HIZ:40")
-                self.durum = self.NORMAL
+            self._yayinla(self.komut_yay, Komut.BEKLEME_BITTI)
+            self._yayinla(self.komut_yay, Komut.hiz(HIZ_NORMAL))
+            self.durum = self.NORMAL
 
-        # ── YOLOv8 tespiti (her karede çalışır) ──────────────────────────
-        tespitler  = tahmin_yap(frame)
-        siniflar   = [ad for ad, _, _ in tespitler]
+        # ── YOLOv8 tespiti + temporal pencere güncelleme ──────────────────
+        tespitler = tahmin_yap(frame)
+        siniflar  = {ad for ad, _, _ in tespitler}
+        self._tabela_gecmis.append(siniflar)
 
-        # ── DURUM: ISIK_BEKLE ─────────────────────────────────────────────
-        # Yarışma resmi olarak başlamadan önce motor komutu gönderilmez.
-        # (Kılavuz 3.4.1: trafik ışığı yeşile dönünce ≤3 sn içinde hareket)
+        # ── ISIK_BEKLE: yeşil ışık görene kadar hareket yok ───────────────
         if self.durum == self.ISIK_BEKLE:
             if yesil_isik_var_mi(tespitler, frame):
-                self.get_logger().info("YEŞİL IŞIK ALGILANDI — Yarışma başlıyor!")
-                self._yayinla(self.komut_yay, "YESIL_ISIK")
-                self._yayinla(self.komut_yay, "HIZ:40")
+                self.get_logger().info("YEŞİL IŞIK — yarışma başlıyor!")
+                self._yayinla(self.komut_yay, Komut.YESIL_ISIK)
+                self._yayinla(self.komut_yay, Komut.hiz(HIZ_NORMAL))
                 self.durum = self.NORMAL
-            # Işık bekleme ekranı (isteğe bağlı)
             if GORUNTU_GOSTER:
-                cv2.imshow("Beyin Node", frame)
-                cv2.waitKey(1)
-            return   # Aşağıdaki normal sürüş koduna geçme
+                cv2.imshow("Beyin", frame); cv2.waitKey(1)
+            return
 
-        # ── DURUM: NORMAL — tabela mantığı ───────────────────────────────
+        # ── NORMAL: tabela mantığı (cooldown + temporal filter) ───────────
         cooldown_ok = (su_an - self.son_tabela_zamani) > TABELA_COOLDOWN
 
-        if siniflar and cooldown_ok:
-
-            # 1) YAYA GEÇİDİ veya HEMZEMİN GEÇİT (Görev 2 & 4)
-            #    dur_komutu_var_mi() IsikTabelasi tespitini HSV ile doğrular:
-            #    gerçek trafik ışığı → yoksay, uyarı tabelası → dur komutu ver
-            if dur_komutu_var_mi(tespitler, frame):
-                self.get_logger().warn(
-                    "DUR komutu — 5 sn bekleniyor"
-                )
-                self._yayinla(self.komut_yay, "DUR")
-                # Durumu güncelle; bekleme timer'ı kare callback'te kontrol edilir
-                self.durum         = self.DUR_BEKLE
+        if cooldown_ok and siniflar:
+            # 1) DUR sınıfları (yaya/hemzemin/dur/IsikTabelasi-tabela)
+            if dur_komutu_var_mi(tespitler, frame) and any(
+                self._kararli(s) for s in
+                ("YayaGecidi", "HemzeminGecit", "dur", "IsikTabelasi")
+            ):
+                self.get_logger().warn("DUR — 5 sn bekleniyor")
+                self._yayinla(self.komut_yay, Komut.DUR)
+                self.durum = self.DUR_BEKLE
                 self.bekleme_bitis = su_an + 5
                 self.son_tabela_zamani = su_an
                 return
 
-            # 2) HIZ TÜMSEĞİ (Görev 3)
-            #    Durma yok; sadece hızı düşür, tümsek geçilince normal hıza dön.
-            elif "HizTumseği" in siniflar:
-                self._yayinla(self.komut_yay, "HIZ:20")
+            # 2) Hız tümseği
+            elif self._kararli("HizTumseği"):
+                self._yayinla(self.komut_yay, Komut.hiz(HIZ_YAVAS))
                 self.son_tabela_zamani = su_an
 
-            # 3) SOLLAMA SERBEST (Görev 5)
-            #    Sol şerite geç, orange aracı sol şeritten geç, geri dön.
-            #    Manevranın detayı motor sürücü node'unda uygulanır.
-            elif "SollamaSerbest" in siniflar:
-                self._yayinla(self.komut_yay, "SOLLAMA")
+            # 3) Sollama serbest
+            elif self._kararli("SollamaSerbest"):
+                self._yayinla(self.komut_yay, Komut.SOLLAMA)
                 self.son_tabela_zamani = su_an
 
-            # 4) ÇIKMAZ YOL (Görev 6)
-            #    Çıkmaz yola GİRME; sağa dön ve parkura devam et.
-            elif "CikmazYol" in siniflar:
-                self._yayinla(self.komut_yay, "SAGA_DON")
+            # 4) Çıkmaz yol
+            elif self._kararli("CikmazYol"):
+                self._yayinla(self.komut_yay, Komut.SAGA_DON)
                 self.son_tabela_zamani = su_an
 
-            # 5) PARK TABELASI (Görev 7 — ön uyarı)
-            #    Kırmızı park alanı yakında; motoru ayarla, alan beklensin.
-            elif "Park" in siniflar:
-                self._yayinla(self.komut_yay, "PARK_TABELASI")
+            # 5) Park tabelası (Görev 7 — ön uyarı)
+            elif self._kararli("Park"):
+                self._yayinla(self.komut_yay, Komut.PARK_TABELASI)
                 self.son_tabela_zamani = su_an
 
-            # 6) KIRMIZI PARK ALANI (Görev 7 — bitiş)
-            #    Araç kırmızı alana girdi; dur, yarışma tamamlandı.
-            elif "KirmiziPark" in siniflar:
-                self._yayinla(self.komut_yay, "PARK_ET")
+            # 6) Kırmızı park alanı (Görev 7 — bitiş)
+            elif self._kararli("KirmiziPark"):
+                self._yayinla(self.komut_yay, Komut.PARK_ET)
                 self.son_tabela_zamani = su_an
 
-        # ── Şerit takibi: sapma değerini /serit_sapma'ya yayınla ─────────
-        # otonom_beyin() perspektif dönüşümü + histogram ile merkez sapmasını verir.
-        # Motor sürücü node'u bu değeri alıp direksiyonu (servo/ESC) ayarlar.
+        # ── Şerit takibi: sapma değerini sürekli yayınla ──────────────────
         try:
             _, sapma = otonom_beyin(frame)
             self._yayinla(self.sapma_yay, f"SAPMA:{sapma}")
         except Exception as hata:
-            self.get_logger().warn(f"Şerit takibi hatası: {hata}", throttle_duration_sec=5)
+            self.get_logger().warn(
+                f"Şerit takibi hatası: {hata}", throttle_duration_sec=5
+            )
 
-        # ── Görüntü (Jetson'da GORUNTU_GOSTER=True ise) ───────────────────
+        # ── Görüntü (debug) ──────────────────────────────────────────────
         if GORUNTU_GOSTER:
             for ad, conf, (x1, y1, x2, y2) in tespitler:
-                renk = (0, 0, 255) if ad in DURMA_SINIFLARI else (0, 255, 0)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), renk, 2)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.putText(frame, f"{ad} {conf:.0%}", (x1, max(y1-6, 0)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, renk, 1)
-            cv2.imshow("Beyin Node", frame)
-            cv2.waitKey(1)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cv2.imshow("Beyin", frame); cv2.waitKey(1)
 
     # ── Bekleme ekranı (yalnızca GORUNTU_GOSTER=True ise) ─────────────────
-
     def _bekle_ekrani(self, frame, kalan: float) -> None:
         overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (FRAME_GENISLIK, FRAME_YUKSEKLIK),
+        cv2.rectangle(overlay, (0, 0), (frame.shape[1], frame.shape[0]),
                       (0, 0, 160), -1)
         goruntu = cv2.addWeighted(overlay, 0.35, frame, 0.65, 0)
         cv2.putText(goruntu, f"BEKLEME: {kalan:.1f} sn",
-                    (20, FRAME_YUKSEKLIK // 2),
+                    (20, frame.shape[0] // 2),
                     cv2.FONT_HERSHEY_DUPLEX, 1.1, (0, 0, 255), 2)
-        cv2.imshow("Beyin Node", goruntu)
-        cv2.waitKey(1)
+        cv2.imshow("Beyin", goruntu); cv2.waitKey(1)
 
-    # ── Node kapanırken temizlik ───────────────────────────────────────────
-
+    # ── Node kapanırken temizlik ──────────────────────────────────────────
     def destroy_node(self) -> None:
+        self._kapaniyor.set()
+        self._kamera_thread.join(timeout=1.0)
         self.cap.release()
         cv2.destroyAllWindows()
         self.get_logger().info("AracBeyniNode kapatıldı.")
@@ -269,13 +314,8 @@ class AracBeyniNode(Node):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Giriş noktası — Jetson'da: python3 ros2_beyin_yayin.py
-# ══════════════════════════════════════════════════════════════════════════════
-
 def main(args=None):
-    # ROS2 iletişim katmanını başlat
     rclpy.init(args=args)
-
     try:
         node = AracBeyniNode()
     except RuntimeError as e:
@@ -283,10 +323,12 @@ def main(args=None):
         rclpy.shutdown()
         sys.exit(1)
 
+    # MultiThreadedExecutor: timer + heartbeat + (varsa) gelecekte abonelikler paralel
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
+
     try:
-        # spin(): Node'u ayakta tutar; timer callback'lerini ve mesajları işler.
-        # Ctrl+C veya rclpy.shutdown() çağrılana kadar buradan çıkmaz.
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         print("\n[BİTİŞ] Ctrl+C alındı, node kapatılıyor...")
     finally:

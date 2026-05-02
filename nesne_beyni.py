@@ -10,14 +10,28 @@ from ultralytics import YOLO
 from goruntu_islem import on_isle, kirmizi_var_mi, mavi_var_mi, sari_var_mi
 
 # ── Ayarlar ────────────────────────────────────────────────────────────────
-# TensorRT engine varsa önce onu kullan (Jetson'da 3-4× hızlı)
-# Export komutu (Jetson terminalinde çalıştır):
-#   yolo export model=best.pt format=engine half=True device=0 imgsz=416
-MODEL_YOLU   = "best.engine" if os.path.exists("best.engine") else "best.pt"
+# Model dosyası otomatik seçimi — platforma göre optimize formatı kullanır.
+# Öncelik sırası:
+#   1. best_ncnn_model/   → Raspberry Pi 4 (ARM CPU, 5-8× hızlı, ÖNERİLEN)
+#                          Export: yolo export model=best.pt format=ncnn imgsz=320
+#   2. best.engine        → Jetson (TensorRT, CUDA gerekir)
+#                          Export: yolo export model=best.pt format=engine half=True imgsz=416
+#   3. best.pt            → Fallback (yavaş; Pi4'te 1-3 FPS verir)
+if os.path.isdir("best_ncnn_model"):
+    MODEL_YOLU = "best_ncnn_model"
+elif os.path.exists("best.engine"):
+    MODEL_YOLU = "best.engine"
+else:
+    MODEL_YOLU = "best.pt"
 
 GUVEN_ESIGI  = 0.35         # Confidence threshold — 0.35 dengeli başlangıç noktası
                             # Çok yanlış tespit olursa 0.45'e çek
                             # Hâlâ "tespit yok" diyorsa 0.25'e düşür
+
+# YOLO inference giriş boyutu.
+# Pi 4 + NCNN için 320 önerilir (FPS çok daha yüksek, küçük tabela hâlâ bulunur).
+# Jetson/TensorRT için 416 dengeli.
+MODEL_IMGSZ = 320 if os.path.isdir("best_ncnn_model") else 416
 
 # Minimum bounding-box alanı (piksel²)
 # Bu değerin altındaki kutular gürültü — atılır.
@@ -108,8 +122,12 @@ def tahmin_yap(frame) -> list[tuple[str, float, tuple]]:
     if _model is None:
         raise RuntimeError("modeli_yukle() henüz çağrılmadı.")
 
-    isle_frame = on_isle(frame, clahe=True)   # CLAHE parlama azaltma
-    results    = _model(isle_frame, verbose=False)[0]
+    # Adaptif CLAHE: sadece çok karanlık (<80) veya çok parlak (>180) ortamlarda
+    # uygula — normal ışıkta gereksiz CPU yükü yapmasın.
+    gri_ort = float(frame.mean())
+    isle_frame = on_isle(frame, clahe=True) if (gri_ort < 80 or gri_ort > 180) else frame
+
+    results = _model(isle_frame, imgsz=MODEL_IMGSZ, verbose=False)[0]
     tespitler  = []
 
     for box in results.boxes:

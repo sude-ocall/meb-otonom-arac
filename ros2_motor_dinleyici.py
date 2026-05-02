@@ -1,340 +1,374 @@
 """
 ros2_motor_dinleyici.py
-MEB Otonom Araç — ROS2 Motor Sürücü Subscriber Node'u
+MEB Otonom Araç — ROS2 Motor Sürücü Subscriber Node'u (DİFERANSİYEL SÜRÜŞ)
 
-Bu node, ros2_beyin_yayin.py'nin yayınladığı komutları dinler ve
-fiziksel motorları / servo direksiyonu kontrol eder.
+Donanım: Raspberry Pi 4 + L298N + 4× sarı DC gearmotor + 6×AA pil (9V)
+Direksiyon: YOK — sol/sağ motor hız farkıyla dönüş yapılır.
 
-Jetson / Raspberry Pi üzerinde çalıştırmak için:
+Beyin node'unun yayınladığı komutları dinler ve sol/sağ motor PWM'lerini
+diferansiyel olarak ayarlar.
+
+Çalıştırma:
     source /opt/ros/humble/setup.bash
     python3 ros2_motor_dinleyici.py
 
 ──────────────────────────────────────────────────────────────────────────────
-  TOPIC MİMARİSİ  (Emir ve Alara için: bu node ne dinliyor?)
+  TOPIC MİMARİSİ  (Emir & Alara için)
 ──────────────────────────────────────────────────────────────────────────────
 
-  BU NODE DİNLER (Subscriber):
-  ┌─────────────────┬─────────────────┬────────────────────────────────────┐
-  │ Topic adı       │ Mesaj tipi      │ Açıklama                           │
-  ├─────────────────┼─────────────────┼────────────────────────────────────┤
-  │ /arac_komut     │ String          │ Yüksek seviye karar komutları      │
-  │ /serit_sapma    │ String          │ Şerit takibi direksiyon sapması    │
-  └─────────────────┴─────────────────┴────────────────────────────────────┘
+  DİNLER:
+    /arac_komut    String   Yüksek seviye karar komutları
+    /serit_sapma   String   "SAPMA:XX" — şerit sapma değeri (diff hıza çevrilir)
+    /beyin_kalp    String   "KALP" — watchdog; 1sn gelmezse acil fren
 
-  /arac_komut mesajları ve tetiklenen fonksiyonlar:
-  ┌──────────────────┬───────────────────────────────────────────────────┐
-  │ Gelen mesaj      │ Çağrılan fonksiyon(lar)                           │
-  ├──────────────────┼───────────────────────────────────────────────────┤
-  │ "DUR"            │ fren_yap()                                        │
-  │ "PARK_ET"        │ fren_yap()          ← Yarışma bitiş durumu        │
-  │ "HIZ:40"         │ motorlara_guc_ver(40)                             │
-  │ "HIZ:20"         │ motorlara_guc_ver(20)  ← Hız tümseği             │
-  │ "YESIL_ISIK"     │ motorlara_guc_ver(40)  ← Yarışma başlangıcı      │
-  │ "BEKLEME_BITTI"  │ motorlara_guc_ver(40)  ← 5 sn bitti              │
-  │ "SOLLAMA"        │ direksiyonu_cevir(sol) + motorlara_guc_ver(35)    │
-  │ "SAGA_DON"       │ fren_yap() + direksiyonu_cevir(sag)               │
-  │ "PARK_TABELASI"  │ motorlara_guc_ver(25)  ← Yavaş, alan aranıyor    │
-  └──────────────────┴───────────────────────────────────────────────────┘
+  Komut → Diferansiyel hız çevrimi:
+    DUR / PARK_ET     → sol=0,    sağ=0
+    HIZ:40            → cruise=40 (sapma callback delta uygular)
+    YESIL_ISIK        → cruise=40
+    SOLLAMA           → 1sn sola kay (sol yavaş, sağ hızlı)
+    SAGA_DON          → 1.5sn yerinde sağa dönüş (sol+, sağ-)
+    PARK_TABELASI     → cruise=25 (yavaşla)
 
-  /serit_sapma mesaj formatı: "SAPMA:XX"
-      XX pozitif → araç sola kaymış → direksiyonu sola çevir
-      XX negatif → araç sağa kaymış → direksiyonu sağa çevir
+  Sapma → diferansiyel:
+    sol_hız = cruise - kazanım × sapma
+    sağ_hız = cruise + kazanım × sapma
 ──────────────────────────────────────────────────────────────────────────────
 """
 
 import sys
 import os
-import math
+import time
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, qos_profile_sensor_data
 from std_msgs.msg import String
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  DONANIM FONKSİYONLARI  (şimdilik dummy — GPIO kodu buraya yazılacak)
-# ═══════════════════════════════════════════════════════════════════════════
-#
-#  TODO (Emir & Alara):
-#  Aşağıdaki üç fonksiyonu gerçek GPIO koduyla doldurun.
-#  Kullanacağınız kütüphane:
-#    - Raspberry Pi  → import RPi.GPIO as GPIO   (veya gpiozero)
-#    - Jetson Nano   → import Jetson.GPIO as GPIO
-#
-#  L298N Motor Sürücü Pin Şeması (örnek):
-#  ┌──────────┬──────────┬────────────────────────────────────────────┐
-#  │ L298N pin│ GPIO pin │ Açıklama                                   │
-#  ├──────────┼──────────┼────────────────────────────────────────────┤
-#  │ IN1      │ 17       │ Sol/ön motor yön bit-1                     │
-#  │ IN2      │ 27       │ Sol/ön motor yön bit-2                     │
-#  │ ENA      │ 18 (PWM) │ Sol/ön motor hız (0–100 duty cycle)        │
-#  │ IN3      │ 22       │ Sağ/arka motor yön bit-1                   │
-#  │ IN4      │ 23       │ Sağ/arka motor yön bit-2                   │
-#  │ ENB      │ 24 (PWM) │ Sağ/arka motor hız (0–100 duty cycle)      │
-#  └──────────┴──────────┴────────────────────────────────────────────┘
-#
-#  Direksiyon Servo Pin Şeması (örnek):
-#  ┌──────────┬──────────┬────────────────────────────────────────────┐
-#  │ Servo pin│ GPIO pin │ Açıklama                                   │
-#  ├──────────┼──────────┼────────────────────────────────────────────┤
-#  │ Sinyal   │ 12 (PWM) │ 50Hz PWM; 1ms=sol, 1.5ms=orta, 2ms=sağ   │
-#  │ VCC      │ 5V       │ Güç (harici besleme önerilir)              │
-#  │ GND      │ GND      │ Ortak toprak                               │
-#  └──────────┴──────────┴────────────────────────────────────────────┘
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# ── GPIO başlatma (TODO) ───────────────────────────────────────────────────
-# TODO: Aşağıdaki satırları yorumdan çıkar ve pin numaralarını ayarla.
+from komutlar import (Komut, Topic,
+                      HIZ_NORMAL, HIZ_PARK, HIZ_DONUS, HIZ_SOLLAMA,
+                      KALP_TIMEOUT_SN)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  L298N + 4 MOTOR DİFERANSİYEL BAĞLANTI ŞEMASI
+# ═══════════════════════════════════════════════════════════════════════════
 #
-# import RPi.GPIO as GPIO          # Raspberry Pi için
-# import Jetson.GPIO as GPIO       # Jetson için
+#  ┌──────────────────────────────────────────────────────────────────────┐
+#  │  GÜÇ HATLARI:                                                        │
+#  │                                                                      │
+#  │   6×AA pil (9V)  ──>  L298N VIN, GND     (motorları besler)         │
+#  │   USB powerbank  ──>  Pi 4 USB-C          (BEYNI ayrı besler!)      │
+#  │   Pi 4 GND      ──>  L298N GND            (ortak referans şart)     │
+#  └──────────────────────────────────────────────────────────────────────┘
 #
-# PIN_IN1  = 17
-# PIN_IN2  = 27
-# PIN_ENA  = 18   # PWM destekli pin
-# PIN_IN3  = 22
-# PIN_IN4  = 23
-# PIN_ENB  = 24   # PWM destekli pin
-# PIN_SERVO = 12  # PWM destekli pin
+#  ┌──────────────────────────────────────────────────────────────────────┐
+#  │  L298N → MOTOR BAĞLANTISI (DİFERANSİYEL):                           │
+#  │                                                                      │
+#  │   Channel A (OUT1, OUT2)  ──>  SOL ön motor + SOL arka motor        │
+#  │                                  (paralel; aynı yönde döner)        │
+#  │   Channel B (OUT3, OUT4)  ──>  SAĞ ön motor + SAĞ arka motor        │
+#  │                                  (paralel; aynı yönde döner)        │
+#  └──────────────────────────────────────────────────────────────────────┘
+#
+#  ┌──────────────────────────────────────────────────────────────────────┐
+#  │  Pi 4 GPIO → L298N SİNYAL PİNLERİ:                                  │
+#  │                                                                      │
+#  │   GPIO 17  ──>  IN1     │ Sol motorlar yön bit-1                    │
+#  │   GPIO 27  ──>  IN2     │ Sol motorlar yön bit-2                    │
+#  │   GPIO 18  ──>  ENA     │ Sol motorlar PWM hız (1kHz)               │
+#  │   GPIO 22  ──>  IN3     │ Sağ motorlar yön bit-1                    │
+#  │   GPIO 23  ──>  IN4     │ Sağ motorlar yön bit-2                    │
+#  │   GPIO 24  ──>  ENB     │ Sağ motorlar PWM hız (1kHz)               │
+#  └──────────────────────────────────────────────────────────────────────┘
+
+# TODO (Emir & Alara): araç bağlanırken aşağıdaki bloğu yorumdan çıkarın.
+#
+# import RPi.GPIO as GPIO
+#
+# PIN_IN1, PIN_IN2, PIN_ENA = 17, 27, 18    # SOL taraf motorlar
+# PIN_IN3, PIN_IN4, PIN_ENB = 22, 23, 24    # SAĞ taraf motorlar
 #
 # GPIO.setmode(GPIO.BCM)
+# GPIO.setwarnings(False)
 # GPIO.setup([PIN_IN1, PIN_IN2, PIN_ENA, PIN_IN3, PIN_IN4, PIN_ENB], GPIO.OUT)
-# GPIO.setup(PIN_SERVO, GPIO.OUT)
-# pwm_sag  = GPIO.PWM(PIN_ENA,   1000)   # 1kHz motor PWM
-# pwm_sol  = GPIO.PWM(PIN_ENB,   1000)
-# pwm_servo= GPIO.PWM(PIN_SERVO,   50)   # 50Hz servo PWM
-# pwm_sag.start(0); pwm_sol.start(0); pwm_servo.start(7.5)  # 7.5 → orta konum
-
-# ── Sabitleri ─────────────────────────────────────────────────────────────
-SERVO_ORTA    =  0    # Düz ilerleme (derece cinsinden sıfır referans)
-SERVO_MAX_SOL =  45   # Maksimum sola dönüş açısı
-SERVO_MAX_SAG = -45   # Maksimum sağa dönüş açısı
-HIZ_NORMAL    =  40   # Varsayılan sürüş hızı (0–100 arası PWM yüzdesi)
+# pwm_sol = GPIO.PWM(PIN_ENA, 1000)         # 1kHz motor PWM
+# pwm_sag = GPIO.PWM(PIN_ENB, 1000)
+# pwm_sol.start(0); pwm_sag.start(0)
 
 
-def motorlara_guc_ver(hiz_yuzdesi: int) -> None:
-    """
-    Sürüş motorlarına hız komutu gönderir.
+# ── Sabitler ──────────────────────────────────────────────────────────────
+# PWM güvenlik tavanı: motorlar 3-6V için tasarlanmış, biz 9V/L298N veriyoruz.
+# Tam %100 PWM motorları yakar; %70 ile sınırla.
+PWM_MAX         = 70
 
-    Parametre:
-        hiz_yuzdesi: 0–100 arası tam sayı (PWM duty cycle yüzdesi)
-                     0 = dur, 100 = tam hız
+# Sapma → diferansiyel çevrim katsayısı
+# Aşırı salınım yaparsa 0.3'e düşür; yetersiz cevap verirse 0.5'e çıkar
+SAPMA_KAZANIM   = 0.4
 
-    TODO (Emir & Alara): Aşağıdaki dummy kodu gerçek GPIO komutuyla değiştir.
-    ──────────────────────────────────────────────────────────────────────────
-    # Motorları ileri yönde çalıştır (IN1=HIGH, IN2=LOW)
-    GPIO.output(PIN_IN1, GPIO.HIGH)
-    GPIO.output(PIN_IN2, GPIO.LOW)
-    GPIO.output(PIN_IN3, GPIO.HIGH)
-    GPIO.output(PIN_IN4, GPIO.LOW)
-    # PWM duty cycle ile hız ayarla (0–100)
-    pwm_sag.ChangeDutyCycle(hiz_yuzdesi)
-    pwm_sol.ChangeDutyCycle(hiz_yuzdesi)
-    ──────────────────────────────────────────────────────────────────────────
-    """
-    # ── DUMMY — terminale yaz ──────────────────────────────────────────────
-    print(f"    [MOTOR] ▶  Güç: %{hiz_yuzdesi}  (PWM: {hiz_yuzdesi}/100)")
+# Filtreleme: ani hız değişimlerini yumuşat
+HIZ_EWMA        = 0.6   # Yumuşatma katsayısı (0-1, yüksek = daha yumuşak)
+HIZ_MIN_FARK    = 3     # Bu PWM yüzdesi altındaki değişimleri yoksay
+
+# Manevra (SOLLAMA, SAGA_DON) süreleri — bu süre içinde sapma görmezden gelinir
+SURE_SAGA_DON   = 1.5   # saniye
+SURE_SOLLAMA    = 1.2
 
 
-def direksiyonu_cevir(aci: float) -> None:
-    """
-    Direksiyon servosunu verilen açıya çevirir.
-
-    Parametre:
-        aci: negatif = sağa, pozitif = sola (derece)
-             Örn: +45 → sola, 0 → düz, -45 → sağa
-
-    TODO (Emir & Alara): Aşağıdaki dummy kodu gerçek servo komutuyla değiştir.
-    ──────────────────────────────────────────────────────────────────────────
-    # Servo için PWM duty cycle hesabı:
-    #   Merkez (0°)  = 7.5 ms  →  duty ≈ 7.5  (50Hz'de 1.5ms pulse)
-    #   Sol   (+45°) = 10.0 ms →  duty ≈ 10.0
-    #   Sağ   (-45°) = 5.0 ms  →  duty ≈ 5.0
-    duty = 7.5 + (aci / 90.0) * 5.0          # -90° → 2.5, +90° → 12.5
-    duty = max(2.5, min(12.5, duty))          # Servonun güvenli aralığı
-    pwm_servo.ChangeDutyCycle(duty)
-    ──────────────────────────────────────────────────────────────────────────
-    """
-    # ── DUMMY — terminale yaz ──────────────────────────────────────────────
-    yon = "SOL ◄" if aci > 0 else ("SAĞ ►" if aci < 0 else "DÜZ ↑")
-    print(f"    [SERVO] {yon}  Açı: {aci:+.1f}°")
-
-
-def fren_yap() -> None:
-    """
-    Motorları durdurur (fren / coast modu).
-
-    TODO (Emir & Alara): Aşağıdaki dummy kodu gerçek GPIO komutuyla değiştir.
-    ──────────────────────────────────────────────────────────────────────────
-    # Hızlı fren (brake): IN1=IN2=HIGH → L298N kısa devre freni
-    GPIO.output(PIN_IN1, GPIO.HIGH)
-    GPIO.output(PIN_IN2, GPIO.HIGH)
-    GPIO.output(PIN_IN3, GPIO.HIGH)
-    GPIO.output(PIN_IN4, GPIO.HIGH)
-    pwm_sag.ChangeDutyCycle(0)
-    pwm_sol.ChangeDutyCycle(0)
-    # Alternatif — motor serbest (coast): IN1=IN2=LOW
-    ──────────────────────────────────────────────────────────────────────────
-    """
-    # ── DUMMY — terminale yaz ──────────────────────────────────────────────
-    print("    [FREN]  ■  MOTORLAR DURDURULDU")
+def kistir(deger: float, min_deg: float, max_deg: float) -> float:
+    """min/max aralığına kıstırır."""
+    return max(min_deg, min(max_deg, deger))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Sapma → Servo açısı dönüştürücü
-# ═══════════════════════════════════════════════════════════════════════════
-
-def sapma_to_aci(sapma: int) -> float:
-    """
-    Şerit takibinden gelen piksel sapmasını servo açısına çevirir.
-
-    Sapma:  pozitif → araç sola kaymış → sola dön (pozitif açı)
-            negatif → araç sağa kaymış → sağa dön (negatif açı)
-
-    TODO (Emir & Alara): KAZANIM sabitini kendi aracınıza göre ayarlayın.
-    Küçük araçta 0.3–0.5, büyük araçta 0.1–0.2 civarı başlangıç için uygundur.
-    """
-    KAZANIM = 0.4   # Piksel başına derece; aşırı salınım yaparsa küçült
-    aci = sapma * KAZANIM
-    # Servo mekanik limitlerini aşma
-    return max(SERVO_MAX_SAG, min(SERVO_MAX_SOL, aci))
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  ROS2 Node Sınıfı
-# ═══════════════════════════════════════════════════════════════════════════
-
 class MotorDinleyiciNode(Node):
-    """
-    /arac_komut ve /serit_sapma topic'lerini dinler,
-    gelen mesajlara göre motorlara ve servoya komut verir.
-    """
+    """Komut dinler, watchdog tutar, sol/sağ motor PWM'lerini diferansiyel ayarlar."""
 
     def __init__(self):
         super().__init__("motor_dinleyici")
 
-        # ── /arac_komut abonesi ────────────────────────────────────────────
-        # ros2_beyin_yayin.py'nin yayınladığı yüksek seviye kararları alır.
-        # queue_size=10: mesaj yığılırsa en fazla 10 bekletilir, eskisi atılır.
-        self.komut_sub = self.create_subscription(
-            String, "/arac_komut", self._komut_callback, 10
+        # ── QoS profilleri (beyin ile uyumlu) ──────────────────────────────
+        komut_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        sensor_qos = qos_profile_sensor_data
+
+        # ── Callback group: paralel callback'ler ──────────────────────────
+        cb = ReentrantCallbackGroup()
+
+        # ── Subscriber'lar ─────────────────────────────────────────────────
+        self.create_subscription(
+            String, Topic.ARAC_KOMUT,  self._komut_cb, komut_qos, callback_group=cb
+        )
+        self.create_subscription(
+            String, Topic.SERIT_SAPMA, self._sapma_cb, sensor_qos, callback_group=cb
+        )
+        self.create_subscription(
+            String, Topic.KALP_ATIS,   self._kalp_cb,  sensor_qos, callback_group=cb
         )
 
-        # ── /serit_sapma abonesi ───────────────────────────────────────────
-        # Şerit takibinden gelen anlık sapma değerini alır ("SAPMA:XX").
-        # Bu değer sürekli yayınlanır; her mesajda servo güncellenir.
-        self.sapma_sub = self.create_subscription(
-            String, "/serit_sapma", self._sapma_callback, 10
-        )
+        # ── Durum değişkenleri ─────────────────────────────────────────────
+        self._cruise_hiz    = 0       # Hedef cruise PWM (0-100, sapma'sız)
+        self._sol_son_pwm   = 0.0     # Son uygulanan sol motor PWM (-100..+100)
+        self._sag_son_pwm   = 0.0     # Son uygulanan sağ motor PWM (-100..+100)
+        self._son_kalp      = self.get_clock().now()
+        self._manevra_bitis = 0.0     # Bu zaman geçene kadar sapma yoksay
 
-        # Mevcut hız durumunu hatırlayalım (sapma gelince üzerine yazmasın)
-        self._son_hiz = 0
+        # ── Watchdog: 200ms'de bir heartbeat kontrolü ─────────────────────
+        self.create_timer(0.2, self._watchdog, callback_group=cb)
 
-        self.get_logger().info("━━━ MotorDinleyiciNode başlatıldı ━━━")
-        self.get_logger().info("  Dinleniyor: /arac_komut | /serit_sapma")
+        self.get_logger().info("━━━ MotorDinleyiciNode (DİFERANSİYEL) başlatıldı ━━━")
+        self.get_logger().info("  Dinleniyor: /arac_komut | /serit_sapma | /beyin_kalp")
 
-    # ── /arac_komut callback ──────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    #  DONANIM FONKSİYONLARI — TODO bloklarını gerçek GPIO koduyla doldurun
+    # ══════════════════════════════════════════════════════════════════════
 
-    def _komut_callback(self, msg: String) -> None:
+    def _sol_motor_set(self, pwm: float) -> None:
         """
-        Gelen komut mesajını ayrıştırır ve uygun donanım fonksiyonunu çağırır.
-        ros2_beyin_yayin.py'nin yayınladığı tam mesaj listesi:
-            DUR | PARK_ET | HIZ:XX | YESIL_ISIK | BEKLEME_BITTI |
-            SOLLAMA | SAGA_DON | PARK_TABELASI
+        Sol taraf motorlarına işaretli PWM uygular.
+        pwm: -PWM_MAX..+PWM_MAX  (negatif = geri, pozitif = ileri, 0 = serbest)
+
+        TODO (Emir): Aşağıdaki dummy yerine gerçek GPIO komutu:
+
+            pwm = max(-PWM_MAX, min(PWM_MAX, pwm))   # güvenlik kıstırma
+            if pwm > 0:                                # İleri
+                GPIO.output(PIN_IN1, GPIO.HIGH)
+                GPIO.output(PIN_IN2, GPIO.LOW)
+                pwm_sol.ChangeDutyCycle(pwm)
+            elif pwm < 0:                              # Geri
+                GPIO.output(PIN_IN1, GPIO.LOW)
+                GPIO.output(PIN_IN2, GPIO.HIGH)
+                pwm_sol.ChangeDutyCycle(abs(pwm))
+            else:                                      # Serbest (coast)
+                GPIO.output(PIN_IN1, GPIO.LOW)
+                GPIO.output(PIN_IN2, GPIO.LOW)
+                pwm_sol.ChangeDutyCycle(0)
         """
+        self.get_logger().debug(f"[SOL]  {pwm:+6.1f}%")
+
+    def _sag_motor_set(self, pwm: float) -> None:
+        """
+        Sağ taraf motorlarına işaretli PWM uygular.
+        pwm: -PWM_MAX..+PWM_MAX  (negatif = geri, pozitif = ileri)
+
+        TODO (Emir): Aşağıdaki dummy yerine gerçek GPIO komutu:
+
+            pwm = max(-PWM_MAX, min(PWM_MAX, pwm))
+            if pwm > 0:
+                GPIO.output(PIN_IN3, GPIO.HIGH)
+                GPIO.output(PIN_IN4, GPIO.LOW)
+                pwm_sag.ChangeDutyCycle(pwm)
+            elif pwm < 0:
+                GPIO.output(PIN_IN3, GPIO.LOW)
+                GPIO.output(PIN_IN4, GPIO.HIGH)
+                pwm_sag.ChangeDutyCycle(abs(pwm))
+            else:
+                GPIO.output(PIN_IN3, GPIO.LOW)
+                GPIO.output(PIN_IN4, GPIO.LOW)
+                pwm_sag.ChangeDutyCycle(0)
+        """
+        self.get_logger().debug(f"[SAĞ]  {pwm:+6.1f}%")
+
+    def _fren_yap(self) -> None:
+        """
+        Tüm motorları durdurur (kısa devre fren modu).
+
+        TODO (Emir): Aşağıdaki dummy yerine GPIO fren komutu:
+
+            GPIO.output(PIN_IN1, GPIO.HIGH); GPIO.output(PIN_IN2, GPIO.HIGH)
+            GPIO.output(PIN_IN3, GPIO.HIGH); GPIO.output(PIN_IN4, GPIO.HIGH)
+            pwm_sol.ChangeDutyCycle(0); pwm_sag.ChangeDutyCycle(0)
+        """
+        self.get_logger().info("[FREN] motorlar durduruldu")
+        self._sol_son_pwm = 0.0
+        self._sag_son_pwm = 0.0
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Diferansiyel hız uygulama yardımcısı (filtreleme + kıstırma)
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _diff_uygula(self, sol_hedef: float, sag_hedef: float) -> None:
+        """Hedef sol/sağ PWM'lerini EWMA filtresi + min-fark eşiği ile uygular."""
+        # Güvenlik tavanı
+        sol_hedef = kistir(sol_hedef, -PWM_MAX, PWM_MAX)
+        sag_hedef = kistir(sag_hedef, -PWM_MAX, PWM_MAX)
+
+        # EWMA: ani değişimleri yumuşat
+        sol_yeni = HIZ_EWMA * self._sol_son_pwm + (1 - HIZ_EWMA) * sol_hedef
+        sag_yeni = HIZ_EWMA * self._sag_son_pwm + (1 - HIZ_EWMA) * sag_hedef
+
+        # Min-fark: küçük titreşimlere komut gönderme
+        if (abs(sol_yeni - self._sol_son_pwm) >= HIZ_MIN_FARK or
+            abs(sag_yeni - self._sag_son_pwm) >= HIZ_MIN_FARK):
+            self._sol_son_pwm = sol_yeni
+            self._sag_son_pwm = sag_yeni
+            self._sol_motor_set(sol_yeni)
+            self._sag_motor_set(sag_yeni)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  WATCHDOG: beyin sessizse acil fren
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _watchdog(self) -> None:
+        gecen = (self.get_clock().now() - self._son_kalp).nanoseconds / 1e9
+        if gecen > KALP_TIMEOUT_SN and self._cruise_hiz != 0:
+            self.get_logger().error(
+                f"BEYIN BAĞLANTISI YOK ({gecen:.1f}sn) — ACİL FREN!"
+            )
+            self._cruise_hiz = 0
+            self._fren_yap()
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  CALLBACK'ler
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _kalp_cb(self, msg: String) -> None:
+        """Beyin yaşıyor sinyali — watchdog'u sıfırlar."""
+        self._son_kalp = self.get_clock().now()
+
+    def _komut_cb(self, msg: String) -> None:
+        """Yüksek seviye karar komutlarını işler."""
         komut = msg.data.strip()
-        self.get_logger().info(f"[KOMUT ALINDI] '{komut}'")
+        self.get_logger().info(f"[KOMUT] '{komut}'")
 
-        # ── Dur / Fren komutları ──────────────────────────────────────────
-        if komut in ("DUR", "PARK_ET"):
-            # "DUR"     → Yaya geçidi veya hemzemin geçit; 5 sn duracak
-            # "PARK_ET" → Kırmızı park alanı bulundu; yarışma bitti
-            self.get_logger().warn(f"FREN → {komut}")
-            fren_yap()
-            direksiyonu_cevir(SERVO_ORTA)   # Direksiyonu düze al
-            self._son_hiz = 0
+        # ── Dur / Park (yarışma sonu) ─────────────────────────────────────
+        if komut in (Komut.DUR, Komut.PARK_ET):
+            self._cruise_hiz = 0
+            self._fren_yap()
 
-        # ── Bekleme bitti / Yeşil ışık → normal hıza geç ─────────────────
-        elif komut in ("YESIL_ISIK", "BEKLEME_BITTI"):
-            self.get_logger().info(f"HAREKET → {komut}")
-            self._son_hiz = HIZ_NORMAL
-            motorlara_guc_ver(self._son_hiz)
+        # ── Yeşil ışık / bekleme bitti → normal hıza geç ──────────────────
+        elif komut in (Komut.YESIL_ISIK, Komut.BEKLEME_BITTI):
+            self._cruise_hiz = HIZ_NORMAL
+            # İlk hareket: doğrudan cruise, sapma callback delta uygular
+            self._diff_uygula(HIZ_NORMAL, HIZ_NORMAL)
 
-        # ── HIZ:XX komutu — örn. "HIZ:40" veya "HIZ:20" ──────────────────
+        # ── HIZ:XX (cruise hızı güncelleme) ──────────────────────────────
         elif komut.startswith("HIZ:"):
-            try:
-                hiz = int(komut.split(":")[1])
-                self._son_hiz = hiz
-                motorlara_guc_ver(hiz)
-            except ValueError:
-                self.get_logger().error(f"Geçersiz hız formatı: '{komut}'")
+            hiz = Komut.hiz_parse(komut)
+            if hiz is None:
+                self.get_logger().error(f"Geçersiz hız: '{komut}'")
+                return
+            self._cruise_hiz = hiz
+            # Doğrudan uygulamadan sapma callback'in delta eklemesini bekle
 
-        # ── Sollama manevrası (Görev 5) ───────────────────────────────────
-        # Sol şerite kaymak için servoya açı verilir; motor hızı biraz düşer.
-        # Manevranın tamamını zaman bazlı burada ya da beyin node'unda yönet.
-        elif komut == "SOLLAMA":
-            self.get_logger().info("SOLLAMA → Sol şerite kayılıyor")
-            direksiyonu_cevir(SERVO_MAX_SOL)    # Sola kayma başlat
-            motorlara_guc_ver(35)               # Manevra hızı
+        # ── Sollama (Görev 5) — sol şerite kayma ─────────────────────────
+        elif komut == Komut.SOLLAMA:
+            self.get_logger().info("SOLLAMA → sol şerite kayılıyor")
+            self._cruise_hiz = HIZ_SOLLAMA
+            # Sol motor yavaş, sağ motor hızlı → araç sola kayar
+            self._diff_uygula(HIZ_SOLLAMA * 0.5, HIZ_SOLLAMA * 1.0)
+            self._manevra_bitis = time.time() + SURE_SOLLAMA
 
-        # ── Çıkmaz yol — sağa dönüş (Görev 6) ───────────────────────────
-        elif komut == "SAGA_DON":
-            self.get_logger().warn("ÇIKMAZ YOL → Sağa dönüş")
-            fren_yap()
-            direksiyonu_cevir(SERVO_MAX_SAG)    # Tam sağa
-            motorlara_guc_ver(30)               # Dönüş hızı
-            self._son_hiz = 30
+        # ── Çıkmaz yol → yerinde sağa dönüş (Görev 6) ─────────────────────
+        elif komut == Komut.SAGA_DON:
+            self.get_logger().warn("ÇIKMAZ YOL → yerinde sağa dönüş")
+            self._cruise_hiz = HIZ_DONUS
+            # Sol ileri, sağ geri → tank dönüşü (yerinde 90°)
+            self._diff_uygula(+HIZ_DONUS, -HIZ_DONUS)
+            self._manevra_bitis = time.time() + SURE_SAGA_DON
 
-        # ── Park tabelası görüldü — yavaşla, kırmızı alanı bekle ─────────
-        elif komut == "PARK_TABELASI":
-            self.get_logger().info("PARK TABELASI → Yavaşlıyor")
-            self._son_hiz = 25
-            motorlara_guc_ver(self._son_hiz)
+        # ── Park tabelası — yavaşla, kırmızı alanı bekle ──────────────────
+        elif komut == Komut.PARK_TABELASI:
+            self._cruise_hiz = HIZ_PARK
 
         else:
-            self.get_logger().warn(f"Tanınmayan komut: '{komut}' — yoksayıldı")
+            self.get_logger().warn(f"Tanınmayan komut: '{komut}'")
 
-    # ── /serit_sapma callback ─────────────────────────────────────────────
-
-    def _sapma_callback(self, msg: String) -> None:
+    def _sapma_cb(self, msg: String) -> None:
         """
-        Şerit takibinden gelen "SAPMA:XX" mesajını ayrıştırır.
-        XX değerini servo açısına çevirip direksiyonu günceller.
-
-        Not: Bu callback çok sık çağrılır (kare başına).
-             Araç duruyorsa (hiz=0) direksiyonu hareket ettirme.
+        Şerit sapması → diferansiyel hız delta'sı.
+        Pozitif sapma → sola dönüş gerek (sol motor yavaş, sağ hızlı).
+        Negatif sapma → sağa dönüş gerek (sol hızlı, sağ yavaş).
         """
-        if self._son_hiz == 0:
-            return   # Araç duruyorken servo sallama
+        # Araç duruyor — motor sallama
+        if self._cruise_hiz == 0:
+            return
+
+        # Manevra süresi dolmamış (SOLLAMA / SAGA_DON aktif)
+        if time.time() < self._manevra_bitis:
+            return
 
         try:
             sapma = int(msg.data.split(":")[1])
         except (IndexError, ValueError):
-            self.get_logger().warn(f"Geçersiz sapma formatı: '{msg.data}'")
+            self.get_logger().warn(
+                f"Geçersiz sapma: '{msg.data}'", throttle_duration_sec=5
+            )
             return
 
-        aci = sapma_to_aci(sapma)
-        direksiyonu_cevir(aci)
+        delta = SAPMA_KAZANIM * sapma
+        sol_hedef = self._cruise_hiz - delta   # Sola dönüş için sol yavaşlasın
+        sag_hedef = self._cruise_hiz + delta   # Sola dönüş için sağ hızlansın
+        self._diff_uygula(sol_hedef, sag_hedef)
 
-    # ── Node kapanırken ────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    #  Node kapanırken — güvenlik freni
+    # ══════════════════════════════════════════════════════════════════════
 
     def destroy_node(self) -> None:
-        # Güvenlik: kapanırken motorları durdur
-        fren_yap()
-        # TODO: GPIO.cleanup()   ← gerçek GPIO kullanılıyorsa mutlaka ekle
+        self._fren_yap()
+        # TODO (Emir): GPIO kullanılıyorsa: GPIO.cleanup()
         self.get_logger().info("MotorDinleyiciNode kapatıldı — motorlar durduruldu.")
         super().destroy_node()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Giriş noktası — terminalden: python3 ros2_motor_dinleyici.py
-# ═══════════════════════════════════════════════════════════════════════════
-
 def main(args=None):
     rclpy.init(args=args)
-
     node = MotorDinleyiciNode()
+
+    # 3 callback (komut + sapma + heartbeat) + watchdog timer paralel
+    executor = MultiThreadedExecutor(num_threads=3)
+    executor.add_node(node)
+
     try:
-        # spin(): mesaj geldikçe callback'leri tetikler; Ctrl+C'ye kadar çalışır
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         print("\n[BİTİŞ] Ctrl+C alındı, node kapatılıyor...")
     finally:

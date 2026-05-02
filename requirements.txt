@@ -1,9 +1,61 @@
-# Temel bağımlılıklar
+# ═══════════════════════════════════════════════════════════════════════════
+#  Temel bağımlılıklar (her platformda — MacBook simülasyonu dahil)
+# ═══════════════════════════════════════════════════════════════════════════
 ultralytics>=8.0.0       # YOLOv8 — nesne tespiti (best.pt modeli bu paketle çalışır)
 opencv-python>=4.8.0     # Kamera görüntüsü + HSV renk analizi
 numpy>=1.24.0            # Görüntü işleme için dizi desteği
+ncnn                     # Pi 4 için ARM-optimize inference (5-8× hızlanma)
 
-# ── ROS2 notu ──────────────────────────────────────────────────────────────
-# rclpy ROS2'nin parçasıdır; pip ile kurulmaz.
-# Kurulum: sudo apt install ros-humble-rclpy   (Ubuntu 22.04 için)
-# Daha sonra: source /opt/ros/humble/setup.bash
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ROS2 — pip ile değil, apt ile kurulur
+# ═══════════════════════════════════════════════════════════════════════════
+# Raspberry Pi 4 (Ubuntu 22.04 / Pi OS Bookworm):
+#   sudo apt install ros-humble-rclpy ros-humble-std-msgs
+#   source /opt/ros/humble/setup.bash
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  L298N MOTOR SÜRÜCÜSÜ — GPIO Kütüphanesi (Raspberry Pi 4 için)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# L298N bir HARDWARE chip'idir; ayrı yazılım sürücüsü YOKTUR.
+# Pi 4'ün GPIO pinlerinden HIGH/LOW (yön) ve PWM (hız) sinyali göndereceğiz.
+#
+# ── Pi 4'te kurulum ───────────────────────────────────────────────────────
+#
+#   sudo apt update
+#   sudo apt install python3-rpi.gpio python3-gpiozero
+#
+# ── Doğrulama ─────────────────────────────────────────────────────────────
+#
+#   python3 -c "import RPi.GPIO as GPIO; print('OK — versiyon:', GPIO.VERSION)"
+#
+# UYARI: MacBook'ta `import RPi.GPIO` çalışmaz; sadece Pi 4'te kurulur.
+#        Bu yüzden requirements.txt'e değil yorum altına eklendi.
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  KAMERA — Pi Camera (CSI) için GStreamer libcamera plugin'i
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Pi Camera v2/v3/HQ kullanıyorsan aşağıdakileri Pi 4'te kur:
+#
+#   sudo apt install gstreamer1.0-libcamera python3-libcamera
+#
+# USB kamera kullanıyorsan bu pakete gerek yok — V4L2 zaten var.
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  MODEL DÖNÜŞÜMÜ — best.pt → NCNN (KRİTİK, performans için zorunlu)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Pi 4'te best.pt modeli CPU'da koşar (1-3 FPS — yavaş!).
+# NCNN formatına dönüştürünce 8-15 FPS'e çıkar.
+#
+# ── Tek seferlik dönüşüm (Pi 4'te ya da MacBook'ta) ──────────────────────
+#
+#   yolo export model=best.pt format=ncnn imgsz=320
+#
+# Bu komut "best_ncnn_model/" klasörü oluşturur.
+# nesne_beyni.py bu klasörü görünce otomatik onu kullanır.
