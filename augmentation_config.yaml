@@ -1,0 +1,54 @@
+# YOLOv8 Eğitim Augmentation Konfigürasyonu
+# Kullanım: yolo train model=yolov8n.pt data=dataset.yaml epochs=100 cfg=augmentation_config.yaml
+#
+# Hedef: Küçük/açılı tabelaları daha iyi tanımak + false-positive azaltmak
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Geometrik dönüşümler ──────────────────────────────────────────────────
+# Açılı tabela sorunu için kritik
+degrees: 15.0        # ±15° rotasyon — tabelanın eğik görünmesini simüle eder
+perspective: 0.0005  # Hafif perspektif bozulma — kameraya açılı tabela
+fliplr: 0.5          # Yatay çevirme — dikkat: sola/sağa dönülmez tabelalarında
+                     # eğer veri setinde sol/sağ etiketleri ayrıysa 0.0 yap!
+flipud: 0.0          # Dikey çevirme — tabelalar için gereksiz, kapalı tut
+shear: 5.0           # Yamultma — kamera açı değişimini simüle eder
+translate: 0.15      # ±%15 kaydırma — tabela kısmi görünümü
+
+# ── Ölçek ─────────────────────────────────────────────────────────────────
+# Küçük tabela sorunu için kritik
+scale: 0.6           # ±%60 ölçek — hem yakın hem uzak tabela öğrenir
+                     # 0.6 agresif; model küçük tabelaları çok daha iyi öğrenir
+
+# ── Renk/parlaklık augmentation ───────────────────────────────────────────
+# Işık parlamalarına karşı dayanıklılık için
+hsv_h: 0.015         # Renk tonu kayması — aydınlatma farkını simüle eder
+hsv_s: 0.7           # Doygunluk değişimi — parlak/soluk ortamlar
+hsv_v: 0.4           # Parlaklık değişimi — gece/gündüz/gölge
+
+# ── Mozaik ve kopyala-yapıştır ────────────────────────────────────────────
+mosaic: 1.0          # 4 görüntüyü birleştir — küçük nesne tespitini güçlendirir
+copy_paste: 0.3      # Tabelaları farklı arka planlara yapıştır
+                     # (özellikle az örnek olan sınıflar için çok etkili)
+mixup: 0.1           # İki görüntüyü karıştır — genelleme artar
+
+# ── Kesme (Cutout/Erasing) ────────────────────────────────────────────────
+erasing: 0.4         # Bbox içinde rastgele parça sil — kısmi görünüme dayanıklılık
+                     # Tabela kısmen kapanınca hâlâ tanıyabilmesi için
+
+# ── Önerilen eğitim parametreleri ────────────────────────────────────────
+# (cfg dosyasında değil, komut satırında ver)
+#
+# yolo train \
+#   model=yolov8n.pt \
+#   data=dataset.yaml \
+#   epochs=150 \
+#   imgsz=416 \          ← 640 yerine 416: Jetson'da inference hızlı
+#   batch=16 \
+#   cfg=augmentation_config.yaml \
+#   patience=30 \        ← 30 epoch iyileşme yoksa dur
+#   device=0
+#
+# fliplr=0.0 NOTU:
+#   "SolaDonulmez" ve "SagaDonulmez" sınıflarını eğitirken fliplr=0.0 yap.
+#   Aksi hâlde model görüntüyü çevirip soldakini sağ olarak öğrenir.
+#   Veri setinde bu iki sınıf yoksa 0.5 bırakabilirsin.

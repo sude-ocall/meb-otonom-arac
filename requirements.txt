@@ -1,0 +1,9 @@
+# Temel bağımlılıklar
+ultralytics>=8.0.0       # YOLOv8 — nesne tespiti (best.pt modeli bu paketle çalışır)
+opencv-python>=4.8.0     # Kamera görüntüsü + HSV renk analizi
+numpy>=1.24.0            # Görüntü işleme için dizi desteği
+
+# ── ROS2 notu ──────────────────────────────────────────────────────────────
+# rclpy ROS2'nin parçasıdır; pip ile kurulmaz.
+# Kurulum: sudo apt install ros-humble-rclpy   (Ubuntu 22.04 için)
+# Daha sonra: source /opt/ros/humble/setup.bash
