@@ -115,7 +115,18 @@ HIZ_MIN_FARK    = 3     # Bu PWM yüzdesi altındaki değişimleri yoksay
 
 # Manevra (SOLLAMA, SAGA_DON) süreleri — bu süre içinde sapma görmezden gelinir
 SURE_SAGA_DON   = 1.5   # saniye
-SURE_SOLLAMA    = 1.2
+
+# ── SOLLAMA ÜÇ FAZLI MANEVRA (kılavuz 3.4.5) ──────────────────────────────
+# Tek "kay sola" yetmez; aracın turuncu aracı tamamen geçip sağ şeride
+# dönmesi gerek. Faz sınırları kümülatif (manevra başlangıcından itibaren).
+# Donanım üstünde son ayar yapılacak — bu değerler 35% PWM'de kabaca
+# 1m yana kayma + 1m düz + 1m geri kayma için tahmin.
+SURE_SOLLAMA_FAZ_A   = 1.5   # 0.0 → 1.5 sn  : sol şeride kay
+SURE_SOLLAMA_FAZ_B   = 3.5   # 1.5 → 3.5 sn  : düz git, turuncu aracı geç
+SURE_SOLLAMA_FAZ_C   = 5.0   # 3.5 → 5.0 sn  : sağ şeride dön
+
+# Faz A/C'de yan kayma şiddeti (0=sadece bir motor, 1=eşit)
+SOLLAMA_KAYMA_ORANI  = 0.4
 
 
 def kistir(deger: float, min_deg: float, max_deg: float) -> float:
@@ -159,8 +170,14 @@ class MotorDinleyiciNode(Node):
         self._son_kalp      = self.get_clock().now()
         self._manevra_bitis = 0.0     # Bu zaman geçene kadar sapma yoksay
 
+        # Sollama üç fazlı manevra başlangıcı (0 = aktif değil)
+        self._sollama_baslangic = 0.0
+
         # ── Watchdog: 200ms'de bir heartbeat kontrolü ─────────────────────
         self.create_timer(0.2, self._watchdog, callback_group=cb)
+
+        # ── Sollama tick: 10Hz'de fazları yürüt ──────────────────────────
+        self.create_timer(0.1, self._sollama_tik, callback_group=cb)
 
         self.get_logger().info("━━━ MotorDinleyiciNode (DİFERANSİYEL) başlatıldı ━━━")
         self.get_logger().info("  Dinleniyor: /arac_komut | /serit_sapma | /beyin_kalp")
@@ -218,6 +235,7 @@ class MotorDinleyiciNode(Node):
     def _fren_yap(self) -> None:
         """
         Tüm motorları durdurur (kısa devre fren modu).
+        Sollama manevrası varsa onu da iptal eder (race condition önler).
 
         TODO (Emir): Aşağıdaki dummy yerine GPIO fren komutu:
 
@@ -228,6 +246,7 @@ class MotorDinleyiciNode(Node):
         self.get_logger().info("[FREN] motorlar durduruldu")
         self._sol_son_pwm = 0.0
         self._sag_son_pwm = 0.0
+        self._sollama_baslangic = 0.0
 
     # ══════════════════════════════════════════════════════════════════════
     #  Diferansiyel hız uygulama yardımcısı (filtreleme + kıstırma)
@@ -265,6 +284,43 @@ class MotorDinleyiciNode(Node):
             self._fren_yap()
 
     # ══════════════════════════════════════════════════════════════════════
+    #  SOLLAMA TICK: 10Hz — fazları yürüt
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _sollama_tik(self) -> None:
+        """
+        Sollama manevrası fazlarını süre bazlı yürütür.
+        _sollama_baslangic = 0 ise hiçbir şey yapmaz.
+        """
+        if self._sollama_baslangic == 0.0:
+            return
+
+        gecen = time.time() - self._sollama_baslangic
+
+        if gecen < SURE_SOLLAMA_FAZ_A:
+            # Faz A: sol şeride kay (sağ hızlı, sol yavaş)
+            self._diff_uygula(
+                HIZ_SOLLAMA * SOLLAMA_KAYMA_ORANI,
+                HIZ_SOLLAMA,
+            )
+        elif gecen < SURE_SOLLAMA_FAZ_B:
+            # Faz B: düz git, turuncu aracı geç
+            self._diff_uygula(HIZ_SOLLAMA, HIZ_SOLLAMA)
+        elif gecen < SURE_SOLLAMA_FAZ_C:
+            # Faz C: sağ şeride dön (sol hızlı, sağ yavaş)
+            self._diff_uygula(
+                HIZ_SOLLAMA,
+                HIZ_SOLLAMA * SOLLAMA_KAYMA_ORANI,
+            )
+        else:
+            # Manevra tamamlandı — şerit takibi devraldı
+            self.get_logger().info(
+                f"Sollama tamamlandı ({gecen:.1f}sn) — şerit takibine geçildi"
+            )
+            self._sollama_baslangic = 0.0
+            self._cruise_hiz = HIZ_NORMAL
+
+    # ══════════════════════════════════════════════════════════════════════
     #  CALLBACK'ler
     # ══════════════════════════════════════════════════════════════════════
 
@@ -297,13 +353,41 @@ class MotorDinleyiciNode(Node):
             self._cruise_hiz = hiz
             # Doğrudan uygulamadan sapma callback'in delta eklemesini bekle
 
-        # ── Sollama (Görev 5) — sol şerite kayma ─────────────────────────
+        # ── Sollama (Görev 5) — üç fazlı manevra ─────────────────────────
+        # Faz A: sola kay   Faz B: düz git, aracı geç   Faz C: sağa dön
+        # Faz mantığı _sollama_tik()'te yürür; burada sadece manevrayı tetikler.
         elif komut == Komut.SOLLAMA:
-            self.get_logger().info("SOLLAMA → sol şerite kayılıyor")
+            if self._sollama_baslangic > 0:
+                self.get_logger().warn("Sollama zaten devam ediyor — yok sayıldı")
+                return
+            self.get_logger().info("SOLLAMA başladı (3 fazlı manevra)")
             self._cruise_hiz = HIZ_SOLLAMA
-            # Sol motor yavaş, sağ motor hızlı → araç sola kayar
-            self._diff_uygula(HIZ_SOLLAMA * 0.5, HIZ_SOLLAMA * 1.0)
-            self._manevra_bitis = time.time() + SURE_SOLLAMA
+            self._sollama_baslangic = time.time()
+            # Tüm manevra süresince sapma callback yok say
+            self._manevra_bitis = self._sollama_baslangic + SURE_SOLLAMA_FAZ_C
+
+        # ── Sollama erken bitiş — turuncu araç kayboldu, Faz C'ye atla ─
+        elif komut == Komut.SOLLAMA_BITTI:
+            if self._sollama_baslangic == 0.0:
+                # Manevra zaten bitmiş veya hiç başlamamış — yok say
+                return
+            gecen = time.time() - self._sollama_baslangic
+            if gecen < SURE_SOLLAMA_FAZ_A:
+                # Faz A'da iken erken çıkış güvenli değil — sola yeterince kaymadık
+                self.get_logger().info(
+                    "SOLLAMA_BITTI yok sayıldı (Faz A henüz tamamlanmadı)"
+                )
+                return
+            if gecen >= SURE_SOLLAMA_FAZ_B:
+                # Zaten Faz C veya sonrası — etkisi yok
+                return
+            # Faz B → Faz C başlangıcına atla
+            atlanan = SURE_SOLLAMA_FAZ_B - gecen
+            self._sollama_baslangic -= atlanan
+            self._manevra_bitis = self._sollama_baslangic + SURE_SOLLAMA_FAZ_C
+            self.get_logger().info(
+                f"SOLLAMA_BITTI → Faz B'den C'ye atlandı ({atlanan:.1f}sn kazanıldı)"
+            )
 
         # ── Çıkmaz yol → yerinde sağa dönüş (Görev 6) ─────────────────────
         elif komut == Komut.SAGA_DON:
@@ -328,6 +412,10 @@ class MotorDinleyiciNode(Node):
         """
         # Araç duruyor — motor sallama
         if self._cruise_hiz == 0:
+            return
+
+        # Sollama manevrası aktif — fazları _sollama_tik() yürütüyor, sapma yok say
+        if self._sollama_baslangic > 0:
             return
 
         # Manevra süresi dolmamış (SOLLAMA / SAGA_DON aktif)

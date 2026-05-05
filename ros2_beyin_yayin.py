@@ -52,10 +52,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from nesne_beyni import (modeli_yukle, tahmin_yap,
                           yesil_isik_var_mi, dur_komutu_var_mi,
                           cikmaz_yol_var_mi, park_tabelasi_var_mi,
-                          kirmizi_park_alani_bul, park_alani_yonu)
+                          kirmizi_park_alani_bul, park_alani_yonu,
+                          YAYA_YAKIN_MIN_ALAN)
 from serit_beyni import otonom_beyin
+from gorev_dedektor import (hiz_tumsek_var_mi, hemzemin_var_mi,
+                             turuncu_arac_var_mi)
 from komutlar import (Komut, Topic,
-                      HIZ_NORMAL, HIZ_PARK, KALP_HZ)
+                      HIZ_NORMAL, HIZ_YAVAS, HIZ_PARK, HIZ_PARK_SON, KALP_HZ)
+from buton import (buton_kullanilabilir_mi, buton_hazirla,
+                   buton_basildi_mi_bekle, buton_temizle)
 
 # ── Ayarlar ────────────────────────────────────────────────────────────────
 KAMERA_INDEX     = 0
@@ -67,6 +72,25 @@ GORUNTU_GOSTER   = False      # Jetson'da monitör yoksa False (headless)
 # Temporal kararlılık: son N frame'in en az M'sinde tabela görüldüyse kabul et
 KARARLI_PENCERE  = 5
 KARARLI_ESIK     = 3
+
+# Kılavuz 4.4 — azami yarış süresi 4 dakika (240 sn).
+# Brain bu süreyi geçince DUR yayınlar; motor watchdog zaten aktiftir.
+YARIS_SURESI_SN  = 240
+
+# Görev 3 (hız tümseği): yakınlık eşiği — frame yüksekliğinin yüzdesi.
+# 0.85 → tümseğin alt kenarı frame'in alt %15'ine girince yavaşla.
+TUMSEK_YAKINLIK_ESIGI  = 0.85
+TUMSEK_YAVAS_SURE_SN   = 2.5    # bu kadar yavaş gidip normale dön
+
+# Görev 4 (hemzemin geçit): 30 cm kala dur (kılavuz 3.4.4)
+HEMZEMIN_YAKINLIK_ESIGI = 0.85
+
+# Görev 5 (sollama): turuncu araç bbox alanı bu eşiği geçince sollama tetiklenir
+# (~50-80 cm mesafe). Çok erken tetiklerse yükselt, geç tetiklerse düşür.
+SOLLAMA_TETIK_ALAN     = 6000
+# Cooldown motor manevra süresinden (5 sn, ros2_motor_dinleyici.SURE_SOLLAMA_FAZ_C)
+# UZUN olmalı — yoksa manevra ortasında brain ikinci kez SOLLAMA yayınlar.
+SOLLAMA_COOLDOWN       = 12
 
 # ── Kamera pipeline seçimi ────────────────────────────────────────────────
 # Üç mod destekleniyor:
@@ -107,9 +131,6 @@ class AracBeyniNode(Node):
     DUR_BEKLE  = "DUR_BEKLE"
     PARK_ARAMA = "PARK_ARAMA"   # Park tabelası görüldü, HSV ile kırmızı alan aranıyor
 
-    # Görev 7 — yerdeki kırmızı park alanına vardık sayılacak alan oranı
-    PARK_VARDIM_ALAN_ORANI = 0.18
-
     def __init__(self):
         super().__init__("arac_beyni")
 
@@ -149,6 +170,21 @@ class AracBeyniNode(Node):
         self.durum             = self.ISIK_BEKLE
         self.son_tabela_zamani = 0.0
         self.bekleme_bitis     = 0.0
+        self.yaris_baslangic   = 0.0   # Yeşil ışıkla doldurulur, bitişte log için
+        self.yaris_bitti       = False # 240 sn doldu mu?
+
+        # Görev 3: hız tümseğinde yavaş gitme zamanlayıcısı
+        # 0.0 → tümsek modu pasif, >0 → bu zamanda HIZ_NORMAL'e dön
+        self._tumsek_donus_zamani = 0.0
+
+        # Görev 5: sollama cooldown (komut motora gittikten sonra tetiklenmesin)
+        self._son_sollama_zamani  = 0.0
+        # Sollama aktif → turuncu kaybolduğunda erken bitiş tetiklenecek
+        self._sollama_aktif       = False
+        self._sollama_bitti_yayinlandi = False
+
+        # Görev 7: park yaklaşmada hız zaten düşürüldüyse tekrar yayınlama
+        self._park_son_hiza_dusuruldu = False
 
         # ── Temporal kararlılık penceresi ─────────────────────────────────
         # Son N frame'deki sınıf set'lerini tutar. _kararli() oy çokluğuna bakar.
@@ -193,7 +229,19 @@ class AracBeyniNode(Node):
         m = String()
         m.data = mesaj
         topic_yay.publish(m)
-        self.get_logger().info(f"[YAY] {topic_yay.topic_name} ← '{mesaj}'")
+        self.get_logger().info(f"{self._t()}[YAY] {topic_yay.topic_name} ← '{mesaj}'")
+
+    # ── Yarış-zamanı log prefix ───────────────────────────────────────────
+    def _t(self) -> str:
+        """
+        '[T+45.3s] ' formatında prefix.
+        Yarış başlamadıysa '[T-pre] ' döner.
+        Kritik log'larda kullan; throttle'lı log'larda gereksiz.
+        """
+        if self.yaris_baslangic <= 0:
+            return "[T-pre] "
+        gecen = time.time() - self.yaris_baslangic
+        return f"[T+{gecen:5.1f}s] "
 
     # ── Temporal kararlılık kontrolü ──────────────────────────────────────
     def _kararli(self, sinif: str) -> bool:
@@ -208,6 +256,31 @@ class AracBeyniNode(Node):
             return
 
         su_an = time.time()
+
+        # ── Yarış sonu: kılavuz 4.4 — 240 sn azami süre ───────────────────
+        if (self.yaris_baslangic > 0 and not self.yaris_bitti and
+                (su_an - self.yaris_baslangic) >= YARIS_SURESI_SN):
+            gecen = su_an - self.yaris_baslangic
+            self.get_logger().warn(
+                f"{self._t()}4 DAKİKA DOLDU ({gecen:.1f} sn) — yarış sonlandırılıyor"
+            )
+            self._yayinla(self.komut_yay, Komut.DUR)
+            self.yaris_bitti = True
+            self._son_dur_tekrar = su_an
+        # Defansif: yarış bittiyse her 1 sn'de bir DUR'u tekrar yayınla
+        # (RELIABLE QoS olmasına rağmen extra güvenlik — heartbeat aktif kalır)
+        if self.yaris_bitti:
+            if su_an - getattr(self, "_son_dur_tekrar", 0) >= 1.0:
+                self._yayinla(self.komut_yay, Komut.DUR)
+                self._son_dur_tekrar = su_an
+            return
+
+        # ── Görev 3: Hız tümseği yavaşlatma süresi dolduysa normale dön ───
+        if (self._tumsek_donus_zamani > 0 and
+                su_an >= self._tumsek_donus_zamani):
+            self.get_logger().info("Hız tümseği geçildi — normal hıza dönülüyor")
+            self._yayinla(self.komut_yay, Komut.hiz(HIZ_NORMAL))
+            self._tumsek_donus_zamani = 0.0
 
         # ── DUR_BEKLE: 5 sn zorunlu bekleme (Kılavuz 3.4.2 / 3.4.4) ───────
         if self.durum == self.DUR_BEKLE:
@@ -231,7 +304,9 @@ class AracBeyniNode(Node):
         # ── ISIK_BEKLE: yeşil ışık görene kadar hareket yok ───────────────
         if self.durum == self.ISIK_BEKLE:
             if yesil_isik_var_mi(tespitler, frame):
-                self.get_logger().info("YEŞİL IŞIK — yarışma başlıyor!")
+                # Yaris baslangicini önce ayarla ki _t() doğru göstersin
+                self.yaris_baslangic = su_an
+                self.get_logger().info(f"{self._t()}YEŞİL IŞIK — yarışma başlıyor!")
                 self._yayinla(self.komut_yay, Komut.YESIL_ISIK)
                 self._yayinla(self.komut_yay, Komut.hiz(HIZ_NORMAL))
                 self.durum = self.NORMAL
@@ -244,22 +319,37 @@ class AracBeyniNode(Node):
         # park tabelası gördükten sonra HSV ile zemindeki üç renkten
         # SADECE kırmızıyı seçeriz; mavi/yeşil alanları yok sayar.
         if self.durum == self.PARK_ARAMA:
-            var, merkez, alan = kirmizi_park_alani_bul(frame)
+            var, merkez, alan, icinde_mi = kirmizi_park_alani_bul(frame)
             if var:
-                alan_orani = alan / (frame.shape[0] * frame.shape[1])
                 yon = park_alani_yonu(frame, merkez)
 
-                if alan_orani >= self.PARK_VARDIM_ALAN_ORANI:
+                # icinde_mi → kırmızı zemin frame'in dibine kadar uzanıyor
+                # → araç kırmızının üstünde, dur (kılavuz 3.4.7)
+                if icinde_mi:
+                    bitirme = su_an - self.yaris_baslangic
+                    bonus = max(0, int(YARIS_SURESI_SN - bitirme))
                     self.get_logger().warn(
-                        f"PARK TAMAMLANDI (alan oranı={alan_orani:.2f}) — yarışma sonu"
+                        f"{self._t()}PARK TAMAMLANDI — bitirme={bitirme:.1f}s, "
+                        f"süre katsayısı bonusu={bonus}"
                     )
                     self._yayinla(self.komut_yay, Komut.PARK_ET)
                     return
 
+                # Kademeli yaklaşma: kırmızı blob merkezi frame'in alt %35'ine
+                # girdiyse araç parka çok yakın → son yaklaşma hızına geç.
+                _, cy = merkez
+                if (cy > frame.shape[0] * 0.65
+                        and not self._park_son_hiza_dusuruldu):
+                    self.get_logger().info(
+                        f"Park alanı yakın (cy={cy}) — HIZ:{HIZ_PARK_SON}"
+                    )
+                    self._yayinla(self.komut_yay, Komut.hiz(HIZ_PARK_SON))
+                    self._park_son_hiza_dusuruldu = True
+
                 # Yaklaşma: kırmızıya doğru direksiyonu kır.
                 # return ile şerit takibinin sapmayı üzerine yazmasını engelle.
                 self.get_logger().info(
-                    f"Kırmızı alan bulundu — yön={yon:+d} alan={alan_orani:.2f}",
+                    f"Kırmızı alan bulundu — yön={yon:+d} alan={alan} cy={cy}",
                     throttle_duration_sec=1
                 )
                 self._yayinla(self.sapma_yay, f"SAPMA:{yon}")
@@ -271,11 +361,14 @@ class AracBeyniNode(Node):
 
         if cooldown_ok and siniflar:
             # 1) DUR sınıfları (Görev 2 — yaya geçidi / dur tabelası)
-            if dur_komutu_var_mi(tespitler, frame) and any(
+            # min_alan=YAYA_YAKIN_MIN_ALAN ile ~30 cm kala dur (kılavuz 3.4.2)
+            if dur_komutu_var_mi(
+                tespitler, frame, min_alan=YAYA_YAKIN_MIN_ALAN
+            ) and any(
                 self._kararli(s) for s in
                 ("YayaGecidi", "dur", "IsikTabelasi")
             ):
-                self.get_logger().warn("DUR — 5 sn bekleniyor")
+                self.get_logger().warn(f"{self._t()}YAYA GEÇİDİ (yakın) — 5 sn dur")
                 self._yayinla(self.komut_yay, Komut.DUR)
                 self.durum = self.DUR_BEKLE
                 self.bekleme_bitis = su_an + 5
@@ -284,16 +377,84 @@ class AracBeyniNode(Node):
 
             # 2) Çıkmaz yol — modelde 'CikmazYol' yok, 'girilmez' kullanılır
             elif cikmaz_yol_var_mi(tespitler) and self._kararli("girilmez"):
-                self.get_logger().warn("GİRİLMEZ — sağa dönüş")
+                self.get_logger().warn(f"{self._t()}GİRİLMEZ — sağa dönüş")
                 self._yayinla(self.komut_yay, Komut.SAGA_DON)
                 self.son_tabela_zamani = su_an
 
             # 3) Park tabelası (Görev 7 — kırmızı arama moduna geç)
             elif park_tabelasi_var_mi(tespitler) and self._kararli("park"):
-                self.get_logger().info("PARK TABELASI — kırmızı alan aranıyor")
+                self.get_logger().info(f"{self._t()}PARK TABELASI — kırmızı alan aranıyor")
                 self._yayinla(self.komut_yay, Komut.PARK_TABELASI)
                 self.durum = self.PARK_ARAMA
                 self.son_tabela_zamani = su_an
+
+        # ──────────────────────────────────────────────────────────────────
+        # HSV tabanlı görevler — model'de sınıfı yok, paralel kontrol
+        # PARK_ARAMA durumunda tetiklenmesin (park bölgesinde başka şey yok)
+        # ──────────────────────────────────────────────────────────────────
+        if self.durum == self.NORMAL:
+
+            # ── Görev 4: Hemzemin geçit (kılavuz 3.4.4 — 30 cm + 5 sn) ────
+            # Yaya geçidi ile aynı bekleme protokolü; cooldown 'tabela' ile paylaşılır
+            if cooldown_ok:
+                var_hz, yakin_hz = hemzemin_var_mi(frame)
+                if var_hz and yakin_hz >= HEMZEMIN_YAKINLIK_ESIGI:
+                    self.get_logger().warn(
+                        f"{self._t()}HEMZEMİN GEÇİT (yakın={yakin_hz:.2f}) — 5 sn dur"
+                    )
+                    self._yayinla(self.komut_yay, Komut.DUR)
+                    self.durum = self.DUR_BEKLE
+                    self.bekleme_bitis = su_an + 5
+                    self.son_tabela_zamani = su_an
+                    return
+
+            # ── Görev 3: Hız tümseği (kılavuz 3.4.3 — yavaş geç) ──────────
+            # Cooldown'dan bağımsız — tümsek üzerinde tekrar tetiklemek zarar vermez
+            if self._tumsek_donus_zamani == 0.0:
+                var_t, yakin_t = hiz_tumsek_var_mi(frame)
+                if var_t and yakin_t >= TUMSEK_YAKINLIK_ESIGI:
+                    self.get_logger().warn(
+                        f"{self._t()}HIZ TÜMSEĞİ (yakın={yakin_t:.2f}) — yavaşla"
+                    )
+                    self._yayinla(self.komut_yay, Komut.hiz(HIZ_YAVAS))
+                    self._tumsek_donus_zamani = su_an + TUMSEK_YAVAS_SURE_SN
+
+            # ── Görev 5: Turuncu araç → sollama (kılavuz 3.4.5) ────────────
+            # Kılavuz 3.1: turuncu araç yalnızca sollama serbest bölgede olur,
+            # bu yüzden ayrı bir tabela kontrolü gerekmez.
+            var_o, alan_o, _ = turuncu_arac_var_mi(frame)
+
+            # Akıllı erken çıkış: sollama aktifken turuncu artık görünmüyorsa
+            # motor'a SOLLAMA_BITTI yayınla → manevra Faz C'ye atlasın.
+            # Manevra başlangıcından sonra en az 1 sn geçmiş olmalı (sahte erken
+            # çıkışı engelle: kameraya turuncu daha bbox eşiğine girmemiş olabilir).
+            if self._sollama_aktif and not self._sollama_bitti_yayinlandi:
+                gecen = su_an - self._son_sollama_zamani
+                if gecen > 1.0 and not var_o:
+                    self.get_logger().info(
+                        f"Turuncu araç kayboldu ({gecen:.1f}sn) — SOLLAMA_BITTI"
+                    )
+                    self._yayinla(self.komut_yay, Komut.SOLLAMA_BITTI)
+                    self._sollama_bitti_yayinlandi = True
+
+            sollama_cooldown_ok = (
+                (su_an - self._son_sollama_zamani) > SOLLAMA_COOLDOWN
+            )
+            if sollama_cooldown_ok and not self._sollama_aktif:
+                if var_o and alan_o >= SOLLAMA_TETIK_ALAN:
+                    self.get_logger().warn(
+                        f"TURUNCU ARAÇ (alan={alan_o}) — SOLLAMA tetikleniyor"
+                    )
+                    self._yayinla(self.komut_yay, Komut.SOLLAMA)
+                    self._son_sollama_zamani = su_an
+                    self._sollama_aktif = True
+                    self._sollama_bitti_yayinlandi = False
+
+            # Cooldown sona erdiyse sollama state sıfırla
+            if (self._sollama_aktif and
+                    (su_an - self._son_sollama_zamani) >= SOLLAMA_COOLDOWN):
+                self._sollama_aktif = False
+                self._sollama_bitti_yayinlandi = False
 
         # ── Şerit takibi: sapma değerini sürekli yayınla ──────────────────
         try:
@@ -335,12 +496,22 @@ class AracBeyniNode(Node):
 
 # ══════════════════════════════════════════════════════════════════════════════
 def main(args=None):
+    # ── Görev 1, kademe 0: BUTON İLE BAŞLATMA (kılavuz 3.4.1, +50 puan) ───
+    # Buton donanımı yoksa otomatik olarak atlanır (test ortamı için).
+    # Node hiç başlamaz → motor watchdog'u sessiz kalır → hiçbir şey hareket etmez.
+    if buton_kullanilabilir_mi() and buton_hazirla():
+        print("[GÖREV 1] Buton modu aktif — fiziksel butona basılması bekleniyor.")
+        buton_basildi_mi_bekle()
+    else:
+        print("[GÖREV 1] Buton donanımı tespit edilmedi — doğrudan ROS2 başlatılıyor.")
+
     rclpy.init(args=args)
     try:
         node = AracBeyniNode()
     except RuntimeError as e:
         print(f"[HATA] Node başlatılamadı: {e}")
         rclpy.shutdown()
+        buton_temizle()
         sys.exit(1)
 
     # MultiThreadedExecutor: timer + heartbeat + (varsa) gelecekte abonelikler paralel
@@ -354,6 +525,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+        buton_temizle()
 
 
 if __name__ == "__main__":

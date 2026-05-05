@@ -15,6 +15,7 @@ class Komut:
     YESIL_ISIK      = "YESIL_ISIK"
     BEKLEME_BITTI   = "BEKLEME_BITTI"
     SOLLAMA         = "SOLLAMA"
+    SOLLAMA_BITTI   = "SOLLAMA_BITTI"   # Turuncu kayboldu — Faz C'ye geç
     SAGA_DON        = "SAGA_DON"
     PARK_TABELASI   = "PARK_TABELASI"
     PARK_ET         = "PARK_ET"
@@ -44,11 +45,12 @@ class Topic:
 
 
 # ── Hız profilleri ─────────────────────────────────────────────────────────
-HIZ_NORMAL  = 40   # Düz parkur
-HIZ_YAVAS   = 20   # Hız tümseği
-HIZ_PARK    = 25   # Park alanı arama
-HIZ_DONUS   = 30   # Çıkmaz yol dönüşü
-HIZ_SOLLAMA = 35   # Sollama manevrası
+HIZ_NORMAL   = 40   # Düz parkur
+HIZ_YAVAS    = 20   # Hız tümseği
+HIZ_PARK     = 25   # Park tabelası görüldükten sonra arama hızı
+HIZ_PARK_SON = 15   # Kırmızı park alanı yakınında son yaklaşma hızı
+HIZ_DONUS    = 30   # Çıkmaz yol dönüşü
+HIZ_SOLLAMA  = 35   # Sollama manevrası
 
 # ── Watchdog ayarları ─────────────────────────────────────────────────────
 KALP_HZ          = 5.0   # Beyin saniyede 5 kez heartbeat yayınlar

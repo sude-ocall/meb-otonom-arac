@@ -38,6 +38,12 @@ MODEL_IMGSZ = 320 if os.path.isdir("best_ncnn_model") else 416
 # Minimum bounding-box alanı (piksel²) — bu altı gürültü, atılır
 MIN_KUTU_ALANI = 500
 
+# Yaya geçidi tabelası 30 cm mesafede kabaca bu kadar piksel² yer kaplar.
+# Kılavuz 3.4.2: yaya geçidine en fazla 30 cm kala durulmalı.
+# 400×300 frame'de 13 cm tabela ≈ 80×80 px = 6400 px². Tolerans için 4500.
+# Çok erken duruyorsa bu değeri yükselt (ör. 6000); duramıyorsa düşür (3000).
+YAYA_YAKIN_MIN_ALAN = 4500
+
 # Sınıf bazlı beklenen en-boy oranı (genişlik / yükseklik)
 ASPEKT_ORANI: dict[str, tuple[float, float]] = {
     "dur":              (0.75, 1.30),  # Sekizgen — yaklaşık kare
@@ -235,12 +241,22 @@ def _isik_tabelasi_mi_yoksa_uyari_mi(frame, x1, y1, x2, y2) -> bool:
     return isik_orani < 0.08
 
 
-def dur_komutu_var_mi(tespitler: list, frame=None) -> bool:
+def dur_komutu_var_mi(tespitler: list, frame=None, min_alan: int = 0) -> bool:
     """
     5 saniyelik bekleme gerektiren tabela görüldü mü?
     Görev 2 (yaya geçidi) için kullanılır.
+
+    min_alan: 0 (default) → her uzaklıkta tespit kabul
+              >0          → bbox alanı bu değerden büyük olmalı (yakın olmalı)
+    Kılavuz 3.4.2: yaya geçidine en fazla 30 cm kala durulmalı →
+    main akışında YAYA_YAKIN_MIN_ALAN ile çağrılır.
     """
     for ad, _, (x1, y1, x2, y2) in tespitler:
+        if min_alan > 0:
+            alan = (x2 - x1) * (y2 - y1)
+            if alan < min_alan:
+                continue
+
         if ad in {"YayaGecidi", "dur"}:
             return True
 
@@ -271,7 +287,7 @@ def park_tabelasi_var_mi(tespitler: list) -> bool:
 def kirmizi_park_alani_bul(frame,
                             min_alan_orani: float = 0.03,
                             sadece_alt_yari: bool = True
-                            ) -> tuple[bool, tuple[int, int] | None, int]:
+                            ) -> tuple[bool, tuple[int, int] | None, int, bool]:
     """
     Kameranın gördüğü zemindeki kırmızı park alanını bulur.
 
@@ -286,10 +302,13 @@ def kirmizi_park_alani_bul(frame,
       sadece_alt_yari: Sadece görüntünün alt yarısına bak (zemin); üst yarıdaki
                        kırmızı tabelalar/şeyler etkilemesin
 
-    Döner: (var_mi, (cx, cy) veya None, alan_piksel)
+    Döner: (var_mi, (cx, cy) | None, alan, icinde_mi)
       - var_mi:     Kırmızı park alanı bulundu mu
       - (cx, cy):   Tüm-frame koordinatlarında kırmızı bölgenin merkezi
       - alan:       Kırmızı bölgenin piksel sayısı (büyüklük göstergesi)
+      - icinde_mi:  Kırmızının en alt noktası frame'in dibine yakınsa True →
+                    araç fiziksel olarak kırmızı alanın ÜSTÜNDE demektir, dur.
+                    (Kılavuz 3.4.7: park alanı sınırları dışına taşmamalı)
     """
     h, w = frame.shape[:2]
 
@@ -317,23 +336,29 @@ def kirmizi_park_alani_bul(frame,
         kirmizi_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
     if not contours:
-        return False, None, 0
+        return False, None, 0, False
 
     en_buyuk = max(contours, key=cv2.contourArea)
     alan = int(cv2.contourArea(en_buyuk))
 
     min_alan = int(bolge.shape[0] * bolge.shape[1] * min_alan_orani)
     if alan < min_alan:
-        return False, None, alan
+        return False, None, alan, False
 
     M = cv2.moments(en_buyuk)
     if M['m00'] == 0:
-        return False, None, alan
+        return False, None, alan, False
 
     cx = int(M['m10'] / M['m00'])
     cy = int(M['m01'] / M['m00']) + baslama_y    # tam frame koordinatı
 
-    return True, (cx, cy), alan
+    # icinde_mi: kırmızı kontur'un EN ALT y-koordinatı frame'in son %5'inde mi?
+    # Eğer öyleyse araç kırmızı zemine basmış demektir → durmalıyız.
+    _, _, _, h_box = cv2.boundingRect(en_buyuk)
+    en_alt_y = baslama_y + (cv2.boundingRect(en_buyuk)[1] + h_box)
+    icinde_mi = en_alt_y >= int(h * 0.95)
+
+    return True, (cx, cy), alan, icinde_mi
 
 
 def park_alani_yonu(frame, merkez: tuple[int, int]) -> int:

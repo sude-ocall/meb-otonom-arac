@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"with open\\('serit_beyni.py','rb'\\) as f: data=f.read\\(\\); print\\(repr\\(data[-200:]\\)\\)\")",
+      "Bash(python3 -c ' *)"
+    ]
+  }
+}
