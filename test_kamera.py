@@ -121,29 +121,14 @@ while True:
             print("[SİMÜLASYON] YEŞİL IŞIK — MOTORLAR BAŞLADI (hız=40)")
             son_tabela_zamani = su_an
 
-        # Hız tümseği — Görev 3
-        elif "HizTumseği" in siniflar:
-            print("[SİMÜLASYON] HIZ TÜMSEĞİ — HIZ DÜŞÜRÜLDÜ (hız=20)")
+        # Görev 6 — modelde 'CikmazYol' yok, 'girilmez' kullanılıyor
+        elif "girilmez" in siniflar:
+            print("[SİMÜLASYON] GİRİLMEZ TABELASI — SAĞA DÖNÜŞ YAPILIYOR")
             son_tabela_zamani = su_an
 
-        # Sollama serbest — Görev 5
-        elif "SollamaSerbest" in siniflar:
-            print("[SİMÜLASYON] SOLLAMA SERBEST — SOL ŞERİDE GEÇİLİYOR")
-            son_tabela_zamani = su_an
-
-        # Çıkmaz yol — Görev 6
-        elif "CikmazYol" in siniflar:
-            print("[SİMÜLASYON] ÇIKMAZ YOL — SAĞA DÖNÜŞ YAPILIYOR")
-            son_tabela_zamani = su_an
-
-        # Park tabelası — Görev 7 öncesi
-        elif "Park" in siniflar:
-            print("[SİMÜLASYON] PARK TABELASI — KIRMIZI ALAN ARANACAK")
-            son_tabela_zamani = su_an
-
-        # Kırmızı park alanı — Görev 7 bitiş
-        elif "KirmiziPark" in siniflar:
-            print("[SİMÜLASYON] KIRMIZI PARK ALANI — MOTORLAR DURDU. YARIŞMA BİTTİ.")
+        # Görev 7 öncesi — mavi park tabelası
+        elif "park" in siniflar:
+            print("[SİMÜLASYON] PARK TABELASI — KIRMIZI ALAN HSV İLE ARANACAK")
             son_tabela_zamani = su_an
 
     # ── HUD (bilgi katmanı) ────────────────────────────────────────────────

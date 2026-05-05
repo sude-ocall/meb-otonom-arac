@@ -2,6 +2,13 @@
 nesne_beyni.py
 YOLOv8 tabanlı nesne/tabela/ışık tespiti.
 Tüm inference bu modülden geçer; main.py davranış kararlarını verir.
+
+Modeldeki gerçek sınıflar (best_ncnn_model):
+  IsikTabelasi, Tunel, YayaGecidi, dur, durak, forward, girilmez,
+  iki_yonlu_trafik, ileri_sag_mecburi, ileri_sol_mecburi, ilerisag,
+  ilerisol, kavsak, kirmizi, park, parkyasak, saga_birlesim,
+  sagadonulmez, sagdangidiniz, sari, sola_birlesim, soladonulmez,
+  soldangidiniz, turnleft, turnright, yesil
 """
 import os
 import cv2
@@ -10,13 +17,11 @@ from ultralytics import YOLO
 from goruntu_islem import on_isle, kirmizi_var_mi, mavi_var_mi, sari_var_mi
 
 # ── Ayarlar ────────────────────────────────────────────────────────────────
-# Model dosyası otomatik seçimi — platforma göre optimize formatı kullanır.
-# Öncelik sırası:
+# Model dosyası otomatik seçimi.
 #   1. best_ncnn_model/   → Raspberry Pi 4 (ARM CPU, 5-8× hızlı, ÖNERİLEN)
 #                          Export: yolo export model=best.pt format=ncnn imgsz=320
 #   2. best.engine        → Jetson (TensorRT, CUDA gerekir)
-#                          Export: yolo export model=best.pt format=engine half=True imgsz=416
-#   3. best.pt            → Fallback (yavaş; Pi4'te 1-3 FPS verir)
+#   3. best.pt            → Fallback (yavaş; Pi4'te 1-3 FPS)
 if os.path.isdir("best_ncnn_model"):
     MODEL_YOLU = "best_ncnn_model"
 elif os.path.exists("best.engine"):
@@ -24,74 +29,63 @@ elif os.path.exists("best.engine"):
 else:
     MODEL_YOLU = "best.pt"
 
-GUVEN_ESIGI  = 0.35         # Confidence threshold — 0.35 dengeli başlangıç noktası
-                            # Çok yanlış tespit olursa 0.45'e çek
-                            # Hâlâ "tespit yok" diyorsa 0.25'e düşür
+GUVEN_ESIGI  = 0.35         # Confidence threshold — 0.35 dengeli başlangıç
+                            # Çok yanlış tespit → 0.45'e çek
+                            # Hâlâ "tespit yok" → 0.25'e düşür
 
-# YOLO inference giriş boyutu.
-# Pi 4 + NCNN için 320 önerilir (FPS çok daha yüksek, küçük tabela hâlâ bulunur).
-# Jetson/TensorRT için 416 dengeli.
 MODEL_IMGSZ = 320 if os.path.isdir("best_ncnn_model") else 416
 
-# Minimum bounding-box alanı (piksel²)
-# Bu değerin altındaki kutular gürültü — atılır.
-# 400x300 frame'de 20×20 px = 400, 25×25 = 625
+# Minimum bounding-box alanı (piksel²) — bu altı gürültü, atılır
 MIN_KUTU_ALANI = 500
 
-# Sınıf bazlı beklenen en-boy oranı (genişlik / yükseklik) aralıkları.
-# Bu aralık dışına düşen kutular şekil uyumsuzluğu nedeniyle atılır.
-# → Kırmızı tişört gibi geniş nesneler "dur" (kare tabela) yerine geçemez.
-# NOT: Modelindeki gerçek sınıf adlarına göre düzenle.
+# Sınıf bazlı beklenen en-boy oranı (genişlik / yükseklik)
 ASPEKT_ORANI: dict[str, tuple[float, float]] = {
-    "dur":           (0.75, 1.30),  # Sekizgen — yaklaşık kare
-    "YayaGecidi":    (0.65, 1.55),  # Kare tabela
-    "HemzeminGecit": (0.65, 1.55),
-    "IsikTabelasi":  (0.25, 0.65),  # Trafik ışığı direği — dar, uzun
-    "yesil":         (0.25, 0.65),
-    "kirmizi":       (0.25, 0.65),
-    "sari":          (0.25, 0.65),
-    "HizTumseği":    (0.65, 1.55),
-    "SolaDonulmez":  (0.80, 1.25),  # Yuvarlak tabela
-    "SagaDonulmez":  (0.80, 1.25),
-    "SollamaSerbest":(0.65, 1.55),
-    "CikmazYol":     (0.65, 1.55),
-    "Park":          (0.65, 1.55),
-    "KirmiziPark":   (1.80, 10.0),  # Yerdeki kırmızı alan — yatay uzun
+    "dur":              (0.75, 1.30),  # Sekizgen — yaklaşık kare
+    "YayaGecidi":       (0.65, 1.55),
+    "IsikTabelasi":     (0.25, 0.65),  # Trafik ışığı direği — dar uzun
+    "yesil":            (0.25, 0.85),
+    "kirmizi":          (0.25, 0.85),
+    "sari":             (0.25, 0.85),
+    "soladonulmez":     (0.80, 1.25),  # Yuvarlak tabela
+    "sagadonulmez":     (0.80, 1.25),
+    "girilmez":         (0.80, 1.25),  # Yuvarlak — Görev 6 (çıkmaz yol yerine)
+    "park":             (0.65, 1.55),
+    "parkyasak":        (0.80, 1.25),
+    "Tunel":            (0.65, 1.55),
+    "durak":            (0.65, 1.55),
+    "kavsak":           (0.65, 1.55),
+    "iki_yonlu_trafik": (0.65, 1.55),
+    "turnleft":         (0.80, 1.25),
+    "turnright":        (0.80, 1.25),
 }
 
-# Hangi sınıflar için renk doğrulaması zorunlu?
-# Sınıf → hangi renk fonksiyonu çalışsın
-# False-positive önleme: model "dur" dese de bbox'ta kırmızı yoksa at.
+# Sınıf → renk doğrulama: model bu sınıfı dediğinde HSV'de ilgili renk olmalı
 RENK_DOGRULAMA: dict[str, str] = {
     "dur":           "kirmizi",
     "YayaGecidi":    "kirmizi",
-    "HemzeminGecit": "kirmizi",
-    "SolaDonulmez":  "kirmizi",
-    "SagaDonulmez":  "kirmizi",
-    "SollamaSerbest":"mavi",
-    "HizTumseği":    "sari",
+    "soladonulmez":  "kirmizi",
+    "sagadonulmez":  "kirmizi",
+    "girilmez":      "kirmizi",
+    "parkyasak":     "kirmizi",
+    "park":          "mavi",   # Mavi tabela
 }
 
-# Birbirine çok benzeyen tabela çiftleri için sınıf bazlı yüksek eşik.
-# Model bu çiftleri düşük güvenle karıştırıyor; bu eşikler düşük-güvenli
-# yanlış tespiti keser.
-# ÖNEMLİ: test_tespit.py başlarken sınıf adlarını terminale yazar.
-#          Modelindeki gerçek adlar farklıysa burayı güncelle.
+# Çift halinde model karıştırıyor → daha yüksek eşik
 SINIF_ESIGI: dict[str, float] = {
-    "SolaDonulmez": 0.65,   # Sola/sağa dönülmez çifti çok benzer
-    "SagaDonulmez": 0.65,
-    "SolaGec":      0.60,
-    "SagaGec":      0.60,
+    "soladonulmez": 0.55,
+    "sagadonulmez": 0.55,
+    "soldangidiniz": 0.55,
+    "sagdangidiniz": 0.55,
+    "turnleft":     0.55,
+    "turnright":    0.55,
 }
 
-# Hangi sınıf adları "dur ve 5 sn bekle" davranışını tetikler?
-# Modelindeki isimlere göre buraya ekle / çıkar.
+# 5 sn dur + bekle davranışını tetikleyen sınıflar
+# Görev 2 (yaya geçidi) + genel "dur" tabelası
 DURMA_SINIFLARI = {
-    "YayaGecidi",       # Görev 2 — yaya geçidi tabelası
-    "HemzeminGecit",    # Görev 4 — hemzemin geçit tabelası
-    "dur",              # genel dur tabelası
-    "IsikTabelasi",     # Model bazen yaya/hemzemin tabelasını bununla karıştırıyor;
-                        # dur_komutu_var_mi() gerçek ışık mı tabela mı diye HSV ile ayırt eder
+    "YayaGecidi",
+    "dur",
+    "IsikTabelasi",   # Bazen yaya/dur tabelasıyla karışıyor — HSV ile ayırt edilir
 }
 
 # ── Model tek seferlik yüklenir ────────────────────────────────────────────
@@ -99,7 +93,7 @@ _model: YOLO | None = None
 
 
 def modeli_yukle(yol: str = MODEL_YOLU) -> None:
-    """best.pt dosyasını belleğe yükler. main.py başında bir kez çağrılır."""
+    """best_ncnn_model klasörünü belleğe yükler. main.py başında bir kez çağrılır."""
     global _model
     _model = YOLO(yol)
     print(f"[MODEL] '{yol}' yüklendi. Sınıflar: {list(_model.names.values())}")
@@ -111,19 +105,11 @@ def tahmin_yap(frame) -> list[tuple[str, float, tuple]]:
     """
     Verilen BGR karesi üzerinde çıkarım yapar.
     Döner: [(sinif_adi, confidence, (x1,y1,x2,y2)), ...]
-
-    Filtre zinciri (her tespit sırayla geçer):
-      1. Genel güven eşiği (GUVEN_ESIGI)
-      2. Sınıf bazlı yüksek eşik (SINIF_ESIGI — benzer tabela çiftleri)
-      3. Minimum kutu alanı (MIN_KUTU_ALANI — gürültü eler)
-      4. Aspect-ratio kontrolü (ASPEKT_ORANI — yanlış şekilli kutular eler)
-      5. HSV renk doğrulaması (RENK_DOGRULAMA — rengi uymayan kutular eler)
     """
     if _model is None:
         raise RuntimeError("modeli_yukle() henüz çağrılmadı.")
 
     # Adaptif CLAHE: sadece çok karanlık (<80) veya çok parlak (>180) ortamlarda
-    # uygula — normal ışıkta gereksiz CPU yükü yapmasın.
     gri_ort = float(frame.mean())
     isle_frame = on_isle(frame, clahe=True) if (gri_ort < 80 or gri_ort > 180) else frame
 
@@ -131,33 +117,28 @@ def tahmin_yap(frame) -> list[tuple[str, float, tuple]]:
     tespitler  = []
 
     for box in results.boxes:
-        conf    = float(box.conf[0])           # type: ignore[index]
-        cls_id  = int(box.cls[0])              # type: ignore[index]
+        conf    = float(box.conf[0])
+        cls_id  = int(box.cls[0])
         cls_adi = results.names[cls_id]
 
-        # 1. Genel güven eşiği
         if conf < GUVEN_ESIGI:
             continue
 
-        # 2. Karıştırılan tabela çiftleri için sınıf bazlı yüksek eşik
         if conf < SINIF_ESIGI.get(cls_adi, GUVEN_ESIGI):
             continue
 
-        x1, y1, x2, y2 = map(int, box.xyxy[0])  # type: ignore[index]
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
         w, h_box = x2 - x1, y2 - y1
 
-        # 3. Çok küçük kutular gürültü — at
         if w * h_box < MIN_KUTU_ALANI:
             continue
 
-        # 4. Aspect-ratio — şekli uymayan kutu false-positive'dir
         if h_box > 0:
             aspekt = w / h_box
             ar_min, ar_max = ASPEKT_ORANI.get(cls_adi, (0.15, 8.0))
             if not (ar_min <= aspekt <= ar_max):
                 continue
 
-        # 5. HSV renk doğrulaması — model "dur" dedi ama kırmızı piksel yok → at
         renk = RENK_DOGRULAMA.get(cls_adi)
         if renk == "kirmizi" and not kirmizi_var_mi(frame, x1, y1, x2, y2):
             continue
@@ -174,7 +155,6 @@ def tahmin_yap(frame) -> list[tuple[str, float, tuple]]:
 # ── Sınıf sorgulama yardımcıları ──────────────────────────────────────────
 
 def sinif_var_mi(tespitler: list, siniflar: set | str) -> bool:
-    """tespitler içinde verilen sınıf(lar)dan biri var mı?"""
     if isinstance(siniflar, str):
         siniflar = {siniflar}
     return any(ad in siniflar for ad, _, _ in tespitler)
@@ -183,43 +163,30 @@ def sinif_var_mi(tespitler: list, siniflar: set | str) -> bool:
 def yesil_isik_var_mi(tespitler: list, frame=None) -> bool:
     """
     Trafik ışığı gerçekten yeşil mi?
-
-    İki kademeli doğrulama:
-      1. YOLOv8 "yesil" sınıfını güvenle tespit etmeli.
-      2. frame verilirse bbox'ın ALT yarısında HSV yeşil piksel kontrolü yapılır.
-         (Trafik ışığında yeşil lamba en altta bulunur.)
-
-    Neden gerekli?
-      Model bazen kırmızı lambayı yeşil olarak yanlış sınıflandırabilir.
-      HSV onayı bu yanlış tetiklenmeyi engeller.
+    YOLOv8 'yesil' tespitinin üstüne HSV onayı: bbox alt yarısında yeşil baskın olmalı.
     """
     for ad, conf, (x1, y1, x2, y2) in tespitler:
         if ad != "yesil":
             continue
 
-        # frame yoksa model kararına güven (eski davranış)
         if frame is None:
             return True
 
-        # Trafik ışığında yeşil lamba alt kısımda → bbox'ın alt %45'ini al
         h_bbox = y2 - y1
         alt_y1 = y1 + int(h_bbox * 0.55)
         bolge  = frame[max(0, alt_y1):y2, max(0, x1):x2]
 
         if bolge.size == 0:
-            return True   # Kırpma başarısızsa modele güven
+            return True
 
         hsv = cv2.cvtColor(bolge, cv2.COLOR_BGR2HSV)
 
-        # Yeşil: H=50-90  (H=40-49 sarıyla çakışır; 50'den başlatarak ayrım sağlanır)
         yesil_mask = cv2.inRange(
             hsv, np.array([50, 80, 80]), np.array([90, 255, 255])
         )
-        # Sarı: H=20-45  (trafik ışığı sarısı buraya düşer → yeşil sayılmamalı)
         sari_mask = cv2.inRange(
             hsv, np.array([20, 80, 80]), np.array([45, 255, 255])
         )
-        # Kırmızı: HSV'de iki ayrı aralık
         kirmizi_mask = (
             cv2.inRange(hsv, np.array([0,   60, 80]), np.array([10,  255, 255])) |
             cv2.inRange(hsv, np.array([170, 60, 80]), np.array([180, 255, 255]))
@@ -229,8 +196,6 @@ def yesil_isik_var_mi(tespitler: list, frame=None) -> bool:
         sari_say    = cv2.countNonZero(sari_mask)
         kirmizi_say = cv2.countNonZero(kirmizi_mask)
 
-        # Onay: yeterli yeşil piksel VE kırmızıdan fazla VE sarıdan da fazla
-        # → sarı ışık artık yanlışlıkla "yeşil" saymaz
         min_piksel = max(10, int(bolge.shape[0] * bolge.shape[1] * 0.05))
         if yesil_say >= min_piksel and yesil_say > kirmizi_say and yesil_say > sari_say:
             return True
@@ -241,19 +206,11 @@ def yesil_isik_var_mi(tespitler: list, frame=None) -> bool:
 def _isik_tabelasi_mi_yoksa_uyari_mi(frame, x1, y1, x2, y2) -> bool:
     """
     Model 'IsikTabelasi' dediğinde gerçekten uyarı tabelası mı kontrol eder.
-
-    İki kademeli karar:
-      1. Kırmızı baskın (>%12) → kesinlikle uyarı tabelası; arka plandaki yeşil
-         (çimen, ağaç) ne kadar yüksek olursa olsun dur komutu ver.
-      2. Kırmızı az ama yeşil+sarı da az (<8%) → yine tabela kabul et.
-      3. Yeşil+sarı yeterince yüksek (≥%8) → gerçek trafik ışığı.
-
-    Döner: True  → uyarı tabelası (dur komutu ver)
-           False → gerçek trafik ışığı (dur komutu verme)
+    Kırmızı baskın → uyarı tabelası (dur). Yeşil+sarı baskın → gerçek ışık (dur verme).
     """
     bolge = frame[max(0, y1):y2, max(0, x1):x2]
     if bolge.size == 0:
-        return True  # Kırpma başarısızsa tabela kabul et
+        return True
 
     hsv    = cv2.cvtColor(bolge, cv2.COLOR_BGR2HSV)
     toplam = bolge.shape[0] * bolge.shape[1]
@@ -264,7 +221,6 @@ def _isik_tabelasi_mi_yoksa_uyari_mi(frame, x1, y1, x2, y2) -> bool:
     sari_say = cv2.countNonZero(
         cv2.inRange(hsv, np.array([20, 60, 80]), np.array([38, 255, 255]))
     )
-    # HSV'de kırmızı iki ayrı aralıkta yer alır
     kirmizi_say = cv2.countNonZero(
         cv2.inRange(hsv, np.array([0,   60, 80]), np.array([10,  255, 255])) |
         cv2.inRange(hsv, np.array([170, 60, 80]), np.array([180, 255, 255]))
@@ -273,60 +229,124 @@ def _isik_tabelasi_mi_yoksa_uyari_mi(frame, x1, y1, x2, y2) -> bool:
     kirmizi_orani = kirmizi_say / toplam
     isik_orani    = (yesil_say + sari_say) / toplam
 
-    # Kırmızı baskın → arka plandaki yeşilden bağımsız olarak tabela
     if kirmizi_orani > 0.12:
         return True
 
-    # Yeşil+sarı yetersiz → tabela
     return isik_orani < 0.08
 
 
 def dur_komutu_var_mi(tespitler: list, frame=None) -> bool:
     """
     5 saniyelik bekleme gerektiren tabela görüldü mü?
-
-    'IsikTabelasi' tespitinde ek HSV doğrulaması yapılır:
-      - Gerçek trafik ışığı → yoksay (sadece yesil/kirmizi ile ilgilenilir)
-      - Uyarı tabelası (yaya/hemzemin ile karışmış) → dur komutu ver
+    Görev 2 (yaya geçidi) için kullanılır.
     """
     for ad, _, (x1, y1, x2, y2) in tespitler:
-        # Kesin dur sınıfları — doğrudan kabul
-        if ad in {"YayaGecidi", "HemzeminGecit", "dur"}:
+        if ad in {"YayaGecidi", "dur"}:
             return True
 
-        # IsikTabelasi: gerçek ışık mı tabela mı?
         if ad == "IsikTabelasi":
             if frame is None:
-                return True   # frame yoksa güvenli taraf: dur komutu ver
+                return True
             if _isik_tabelasi_mi_yoksa_uyari_mi(frame, x1, y1, x2, y2):
-                return True   # Uyarı tabelası — dur
+                return True
 
     return False
 
 
-def hiz_tumseği_var_mi(tespitler: list) -> bool:
-    """Hız tümseği uyarı tabelası (Görev 3)."""
-    return sinif_var_mi(tespitler, "HizTumseği")
-
-
-def sollama_serbest_var_mi(tespitler: list) -> bool:
-    """Sollama serbest bölge tabelası (Görev 5)."""
-    return sinif_var_mi(tespitler, "SollamaSerbest")
-
-
 def cikmaz_yol_var_mi(tespitler: list) -> bool:
-    """Çıkmaz yol tabelası (Görev 6)."""
-    return sinif_var_mi(tespitler, "CikmazYol")
+    """
+    Görev 6 — modelde 'CikmazYol' yok, yerine 'girilmez' tabelası kullanılır.
+    Kavramsal olarak aynı: 'buraya girme, başka yöne git'.
+    """
+    return sinif_var_mi(tespitler, "girilmez")
 
 
 def park_tabelasi_var_mi(tespitler: list) -> bool:
-    """Park alanı tabelası (Görev 7 öncesi uyarı)."""
-    return sinif_var_mi(tespitler, "Park")
+    """Görev 7 öncesi mavi 'park' tabelası — kırmızı alanı aramaya başla işareti."""
+    return sinif_var_mi(tespitler, "park")
 
 
-def kirmizi_park_alani_var_mi(tespitler: list) -> bool:
-    """Yerdeki kırmızı park alanı görüldü mü? (Görev 7 — bitiş)"""
-    return sinif_var_mi(tespitler, "KirmiziPark")
+# ── Görev 7: Yerdeki kırmızı park alanını HSV ile bul ──────────────────────
+
+def kirmizi_park_alani_bul(frame,
+                            min_alan_orani: float = 0.03,
+                            sadece_alt_yari: bool = True
+                            ) -> tuple[bool, tuple[int, int] | None, int]:
+    """
+    Kameranın gördüğü zemindeki kırmızı park alanını bulur.
+
+    Park alanları kırmızı/mavi/yeşil olarak üç renkten oluşur. YOLOv8 modeli
+    bu zemin renklerini sınıf olarak tanımıyor. Bu yüzden park modunda
+    HSV maskesi ile direkt zemine bakıp en büyük kırmızı bölgeyi seçeriz —
+    böylece mavi ve yeşil park alanları yanlışlıkla seçilmez.
+
+    Parametreler:
+      min_alan_orani:  Frame alanına oranla minimum kırmızı blok büyüklüğü
+                       (0.03 = frame'in en az %3'ü kırmızı olmalı)
+      sadece_alt_yari: Sadece görüntünün alt yarısına bak (zemin); üst yarıdaki
+                       kırmızı tabelalar/şeyler etkilemesin
+
+    Döner: (var_mi, (cx, cy) veya None, alan_piksel)
+      - var_mi:     Kırmızı park alanı bulundu mu
+      - (cx, cy):   Tüm-frame koordinatlarında kırmızı bölgenin merkezi
+      - alan:       Kırmızı bölgenin piksel sayısı (büyüklük göstergesi)
+    """
+    h, w = frame.shape[:2]
+
+    if sadece_alt_yari:
+        baslama_y = h // 2
+        bolge = frame[baslama_y:, :]
+    else:
+        baslama_y = 0
+        bolge = frame
+
+    hsv = cv2.cvtColor(bolge, cv2.COLOR_BGR2HSV)
+
+    # HSV'de kırmızı iki ayrı aralıkta — birleşik maske
+    kirmizi_mask = (
+        cv2.inRange(hsv, np.array([0,   100, 70]), np.array([10,  255, 255])) |
+        cv2.inRange(hsv, np.array([170, 100, 70]), np.array([180, 255, 255]))
+    )
+
+    # Gürültü temizliği — küçük noktaları sil, küçük delikleri kapat
+    kernel = np.ones((5, 5), np.uint8)
+    kirmizi_mask = cv2.morphologyEx(kirmizi_mask, cv2.MORPH_OPEN,  kernel)
+    kirmizi_mask = cv2.morphologyEx(kirmizi_mask, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(
+        kirmizi_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        return False, None, 0
+
+    en_buyuk = max(contours, key=cv2.contourArea)
+    alan = int(cv2.contourArea(en_buyuk))
+
+    min_alan = int(bolge.shape[0] * bolge.shape[1] * min_alan_orani)
+    if alan < min_alan:
+        return False, None, alan
+
+    M = cv2.moments(en_buyuk)
+    if M['m00'] == 0:
+        return False, None, alan
+
+    cx = int(M['m10'] / M['m00'])
+    cy = int(M['m01'] / M['m00']) + baslama_y    # tam frame koordinatı
+
+    return True, (cx, cy), alan
+
+
+def park_alani_yonu(frame, merkez: tuple[int, int]) -> int:
+    """
+    Kırmızı park alanının merkezi frame'in neresinde?
+    Negatif sayı = sol, pozitif = sağ. -100..+100 arası ölçeklenir.
+    Direksiyon komutu olarak doğrudan kullanılabilir.
+    """
+    cx, _ = merkez
+    w = frame.shape[1]
+    yari = w / 2
+    sapma = (cx - yari) / yari   # -1..+1
+    return int(max(-100, min(100, sapma * 100)))
 
 
 # ── Görselleştirme ─────────────────────────────────────────────────────────

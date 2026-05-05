@@ -50,11 +50,12 @@ from std_msgs.msg import String
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from nesne_beyni import (modeli_yukle, tahmin_yap,
-                          yesil_isik_var_mi, dur_komutu_var_mi)
+                          yesil_isik_var_mi, dur_komutu_var_mi,
+                          cikmaz_yol_var_mi, park_tabelasi_var_mi,
+                          kirmizi_park_alani_bul, park_alani_yonu)
 from serit_beyni import otonom_beyin
 from komutlar import (Komut, Topic,
-                      HIZ_NORMAL, HIZ_YAVAS, HIZ_PARK, HIZ_DONUS, HIZ_SOLLAMA,
-                      KALP_HZ)
+                      HIZ_NORMAL, HIZ_PARK, KALP_HZ)
 
 # ── Ayarlar ────────────────────────────────────────────────────────────────
 KAMERA_INDEX     = 0
@@ -104,6 +105,10 @@ class AracBeyniNode(Node):
     ISIK_BEKLE = "ISIK_BEKLE"
     NORMAL     = "NORMAL"
     DUR_BEKLE  = "DUR_BEKLE"
+    PARK_ARAMA = "PARK_ARAMA"   # Park tabelası görüldü, HSV ile kırmızı alan aranıyor
+
+    # Görev 7 — yerdeki kırmızı park alanına vardık sayılacak alan oranı
+    PARK_VARDIM_ALAN_ORANI = 0.18
 
     def __init__(self):
         super().__init__("arac_beyni")
@@ -234,14 +239,41 @@ class AracBeyniNode(Node):
                 cv2.imshow("Beyin", frame); cv2.waitKey(1)
             return
 
+        # ── PARK_ARAMA: HSV ile yerdeki kırmızı park alanını ara ──────────
+        # Görev 7 — model 'KirmiziPark' sınıfını tanımıyor, bu yüzden
+        # park tabelası gördükten sonra HSV ile zemindeki üç renkten
+        # SADECE kırmızıyı seçeriz; mavi/yeşil alanları yok sayar.
+        if self.durum == self.PARK_ARAMA:
+            var, merkez, alan = kirmizi_park_alani_bul(frame)
+            if var:
+                alan_orani = alan / (frame.shape[0] * frame.shape[1])
+                yon = park_alani_yonu(frame, merkez)
+
+                if alan_orani >= self.PARK_VARDIM_ALAN_ORANI:
+                    self.get_logger().warn(
+                        f"PARK TAMAMLANDI (alan oranı={alan_orani:.2f}) — yarışma sonu"
+                    )
+                    self._yayinla(self.komut_yay, Komut.PARK_ET)
+                    return
+
+                # Yaklaşma: kırmızıya doğru direksiyonu kır.
+                # return ile şerit takibinin sapmayı üzerine yazmasını engelle.
+                self.get_logger().info(
+                    f"Kırmızı alan bulundu — yön={yon:+d} alan={alan_orani:.2f}",
+                    throttle_duration_sec=1
+                )
+                self._yayinla(self.sapma_yay, f"SAPMA:{yon}")
+                return
+            # Henüz kırmızı görünmedi → şerit takibi normal sapma yayınlamaya devam etsin
+
         # ── NORMAL: tabela mantığı (cooldown + temporal filter) ───────────
         cooldown_ok = (su_an - self.son_tabela_zamani) > TABELA_COOLDOWN
 
         if cooldown_ok and siniflar:
-            # 1) DUR sınıfları (yaya/hemzemin/dur/IsikTabelasi-tabela)
+            # 1) DUR sınıfları (Görev 2 — yaya geçidi / dur tabelası)
             if dur_komutu_var_mi(tespitler, frame) and any(
                 self._kararli(s) for s in
-                ("YayaGecidi", "HemzeminGecit", "dur", "IsikTabelasi")
+                ("YayaGecidi", "dur", "IsikTabelasi")
             ):
                 self.get_logger().warn("DUR — 5 sn bekleniyor")
                 self._yayinla(self.komut_yay, Komut.DUR)
@@ -250,29 +282,17 @@ class AracBeyniNode(Node):
                 self.son_tabela_zamani = su_an
                 return
 
-            # 2) Hız tümseği
-            elif self._kararli("HizTumseği"):
-                self._yayinla(self.komut_yay, Komut.hiz(HIZ_YAVAS))
-                self.son_tabela_zamani = su_an
-
-            # 3) Sollama serbest
-            elif self._kararli("SollamaSerbest"):
-                self._yayinla(self.komut_yay, Komut.SOLLAMA)
-                self.son_tabela_zamani = su_an
-
-            # 4) Çıkmaz yol
-            elif self._kararli("CikmazYol"):
+            # 2) Çıkmaz yol — modelde 'CikmazYol' yok, 'girilmez' kullanılır
+            elif cikmaz_yol_var_mi(tespitler) and self._kararli("girilmez"):
+                self.get_logger().warn("GİRİLMEZ — sağa dönüş")
                 self._yayinla(self.komut_yay, Komut.SAGA_DON)
                 self.son_tabela_zamani = su_an
 
-            # 5) Park tabelası (Görev 7 — ön uyarı)
-            elif self._kararli("Park"):
+            # 3) Park tabelası (Görev 7 — kırmızı arama moduna geç)
+            elif park_tabelasi_var_mi(tespitler) and self._kararli("park"):
+                self.get_logger().info("PARK TABELASI — kırmızı alan aranıyor")
                 self._yayinla(self.komut_yay, Komut.PARK_TABELASI)
-                self.son_tabela_zamani = su_an
-
-            # 6) Kırmızı park alanı (Görev 7 — bitiş)
-            elif self._kararli("KirmiziPark"):
-                self._yayinla(self.komut_yay, Komut.PARK_ET)
+                self.durum = self.PARK_ARAMA
                 self.son_tabela_zamani = su_an
 
         # ── Şerit takibi: sapma değerini sürekli yayınla ──────────────────
