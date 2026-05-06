@@ -50,14 +50,16 @@ YAYA_YAKIN_MIN_ALAN = 4500
 ASPEKT_ORANI: dict[str, tuple[float, float]] = {
     "dur":              (0.75, 1.30),  # Sekizgen — yaklaşık kare
     "YayaGecidi":       (0.65, 1.55),
-    "IsikTabelasi":     (0.25, 0.65),  # Trafik ışığı direği — dar uzun
+    "IsikTabelasi":     (0.20, 0.55),  # Trafik ışığı direği — dar uzun (sıkılaştırıldı:
+                                       # 0.65 üst sınır kırmızı yuvarlak/kare tabelaları
+                                       # IsikTabelasi olarak geçirebiliyordu)
     "yesil":            (0.25, 0.85),
     "kirmizi":          (0.25, 0.85),
     "sari":             (0.25, 0.85),
-    "soladonulmez":     (0.80, 1.25),  # Yuvarlak tabela
-    "sagadonulmez":     (0.80, 1.25),
+    "soladonulmez":     (0.80, 1.25),  # Yuvarlak tabela — DOĞRU ÇALIŞIYOR, dokunma
+    "sagadonulmez":     (0.80, 1.25),  #                  DOĞRU ÇALIŞIYOR, dokunma
     "girilmez":         (0.80, 1.25),  # Yuvarlak — Görev 6 (çıkmaz yol yerine)
-    "park":             (0.65, 1.55),
+    "park":             (0.70, 1.40),  # Mavi kare (P harfi); kırmızı kenar varsa elenir
     "parkyasak":        (0.80, 1.25),
     "Tunel":            (0.65, 1.55),
     "durak":            (0.65, 1.55),
@@ -76,6 +78,14 @@ RENK_DOGRULAMA: dict[str, str] = {
     "girilmez":      "kirmizi",
     "parkyasak":     "kirmizi",
     "park":          "mavi",   # Mavi tabela
+}
+
+# Sınıf → renk YASAĞI: bu sınıfta ilgili renk OLMAMALI. Pozitif renk doğrulaması
+# yetmediğinde "yanlış sınıf"ları elemek için. Örnek: model 'parkyasak'ı 'park'
+# olarak verirse mavi de var (içeride), kırmızı da (kenarda). Pozitif sadece mavi
+# kontrolüyle ayırt edilemez. Kırmızı YOK kontrolüyle parkyasak elenir.
+RENK_DOGRULAMA_NEGATIF: dict[str, tuple[str, float]] = {
+    "park": ("kirmizi", 0.05),   # Park'ta kırmızı %5'ten fazla varsa parkyasak'tır → ele
 }
 
 # Çift halinde model karıştırıyor → daha yüksek eşik
@@ -156,6 +166,15 @@ def tahmin_yap(frame) -> list[tuple[str, float, tuple]]:
         if renk == "sari"    and not sari_var_mi(frame, x1, y1, x2, y2):
             continue
 
+        # Negatif renk kontrolü — yanlış sınıflandırılmış tabelayı ele
+        # (ör. parkyasak'ı park olarak geçiren model çıktısı)
+        neg = RENK_DOGRULAMA_NEGATIF.get(cls_adi)
+        if neg is not None:
+            yasak_renk, esik_oran = neg
+            if yasak_renk == "kirmizi" and kirmizi_var_mi(
+                    frame, x1, y1, x2, y2, min_oran=esik_oran):
+                continue
+
         tespitler.append((cls_adi, conf, (x1, y1, x2, y2)))
 
     return tespitler
@@ -172,7 +191,19 @@ def sinif_var_mi(tespitler: list, siniflar: set | str) -> bool:
 def yesil_isik_var_mi(tespitler: list, frame=None) -> bool:
     """
     Trafik ışığı gerçekten yeşil mi?
-    YOLOv8 'yesil' tespitinin üstüne HSV onayı: bbox alt yarısında yeşil baskın olmalı.
+    YOLOv8 'yesil' tespitinin üstüne sıkı HSV onayı.
+
+    Önceki sürüm sarı ışığı yeşil olarak geçiriyordu çünkü:
+      • Eşik 'yesil > sari' yeterliydi (1.0× baskınlık)
+      • Sarı (H 20-45) ve yeşil (H 50-90) aralıkları çok yakındı, geçiş tonları
+        yanlış kategoriye düşebiliyordu.
+
+    Yeni mantık:
+      1. Tüm bbox'a bak (alt yarı yerine) — küçük ışık balonlarında yarıya bölmek
+         anlam taşımıyor; tüm bbox renklerin gerçek dağılımını verir.
+      2. Sarı ile yeşil arasında 10°'lik H gap: sarı 20-35, yeşil 45-90.
+         Aradaki belirsiz tonlar (35-45) hiçbir kategoriye girmez → güvenli ret.
+      3. Yeşil hem sarıdan hem kırmızıdan EN AZ 1.5× baskın olmalı.
     """
     for ad, conf, (x1, y1, x2, y2) in tespitler:
         if ad != "yesil":
@@ -181,32 +212,27 @@ def yesil_isik_var_mi(tespitler: list, frame=None) -> bool:
         if frame is None:
             return True
 
-        h_bbox = y2 - y1
-        alt_y1 = y1 + int(h_bbox * 0.55)
-        bolge  = frame[max(0, alt_y1):y2, max(0, x1):x2]
-
+        bolge = frame[max(0, y1):y2, max(0, x1):x2]
         if bolge.size == 0:
-            return True
+            continue
 
         hsv = cv2.cvtColor(bolge, cv2.COLOR_BGR2HSV)
 
-        yesil_mask = cv2.inRange(
-            hsv, np.array([50, 80, 80]), np.array([90, 255, 255])
-        )
-        sari_mask = cv2.inRange(
-            hsv, np.array([20, 80, 80]), np.array([45, 255, 255])
-        )
-        kirmizi_mask = (
-            cv2.inRange(hsv, np.array([0,   60, 80]), np.array([10,  255, 255])) |
-            cv2.inRange(hsv, np.array([170, 60, 80]), np.array([180, 255, 255]))
+        yesil_say = cv2.countNonZero(cv2.inRange(
+            hsv, np.array([45, 80, 80]), np.array([90, 255, 255])
+        ))
+        sari_say = cv2.countNonZero(cv2.inRange(
+            hsv, np.array([20, 80, 80]), np.array([35, 255, 255])
+        ))
+        kirmizi_say = cv2.countNonZero(
+            cv2.inRange(hsv, np.array([0,   80, 80]), np.array([10,  255, 255])) |
+            cv2.inRange(hsv, np.array([170, 80, 80]), np.array([180, 255, 255]))
         )
 
-        yesil_say   = cv2.countNonZero(yesil_mask)
-        sari_say    = cv2.countNonZero(sari_mask)
-        kirmizi_say = cv2.countNonZero(kirmizi_mask)
-
-        min_piksel = max(10, int(bolge.shape[0] * bolge.shape[1] * 0.05))
-        if yesil_say >= min_piksel and yesil_say > kirmizi_say and yesil_say > sari_say:
+        min_piksel = max(15, int(bolge.shape[0] * bolge.shape[1] * 0.04))
+        if (yesil_say >= min_piksel
+                and yesil_say > sari_say * 1.5
+                and yesil_say > kirmizi_say * 1.5):
             return True
 
     return False
@@ -214,34 +240,57 @@ def yesil_isik_var_mi(tespitler: list, frame=None) -> bool:
 
 def _isik_tabelasi_mi_yoksa_uyari_mi(frame, x1, y1, x2, y2) -> bool:
     """
-    Model 'IsikTabelasi' dediğinde gerçekten uyarı tabelası mı kontrol eder.
-    Kırmızı baskın → uyarı tabelası (dur). Yeşil+sarı baskın → gerçek ışık (dur verme).
+    Model 'IsikTabelasi' dediğinde:
+      True  → bu bir kırmızı UYARI TABELASI (dur/girilmez gibi) → DUR komutu ver
+      False → bu gerçek bir TRAFİK IŞIĞI direği → DUR komutu verme
+
+    Eski mantık 'kirmizi_orani > 0.12 → uyari' diyordu, ama trafik ışığında
+    kırmızı yandığında bu da yüksek çıkıyor → kırmızı yanan trafik ışığını da
+    'uyarı tabelası' sanıp DUR yayınlıyordu. Yeni mantık:
+
+      • Trafik ışığı direğinin AYIRT EDİCİ özelliği: dikey eksende EN AZ İKİ
+        FARKLI renk bandı bulundurur (kırmızı + sarı/yeşil cam bölgeleri).
+      • Kırmızı uyarı tabelası TEK renkli (sadece kırmızı, başka renk anlamlı
+        oranda yok).
+
+    Bu yüzden 3 dikey bölgeye bakıp renk dağılımını analiz ederiz.
     """
     bolge = frame[max(0, y1):y2, max(0, x1):x2]
-    if bolge.size == 0:
-        return True
+    if bolge.size == 0 or bolge.shape[0] < 9:
+        return True   # bbox çok küçük/bozuk → güvenli tarafta DUR komutu
 
     hsv    = cv2.cvtColor(bolge, cv2.COLOR_BGR2HSV)
     toplam = bolge.shape[0] * bolge.shape[1]
 
+    # HSV aralıkları yesil_isik_var_mi ile aynı (tutarlı sınıflandırma)
     yesil_say = cv2.countNonZero(
-        cv2.inRange(hsv, np.array([40, 60, 80]), np.array([90, 255, 255]))
+        cv2.inRange(hsv, np.array([45, 80, 80]), np.array([90, 255, 255]))
     )
     sari_say = cv2.countNonZero(
-        cv2.inRange(hsv, np.array([20, 60, 80]), np.array([38, 255, 255]))
+        cv2.inRange(hsv, np.array([20, 80, 80]), np.array([35, 255, 255]))
     )
     kirmizi_say = cv2.countNonZero(
-        cv2.inRange(hsv, np.array([0,   60, 80]), np.array([10,  255, 255])) |
-        cv2.inRange(hsv, np.array([170, 60, 80]), np.array([180, 255, 255]))
+        cv2.inRange(hsv, np.array([0,   80, 80]), np.array([10,  255, 255])) |
+        cv2.inRange(hsv, np.array([170, 80, 80]), np.array([180, 255, 255]))
     )
 
-    kirmizi_orani = kirmizi_say / toplam
-    isik_orani    = (yesil_say + sari_say) / toplam
+    kir_o = kirmizi_say / toplam
+    sar_o = sari_say    / toplam
+    yes_o = yesil_say   / toplam
 
-    if kirmizi_orani > 0.12:
+    # Trafik ışığı direği: kırmızı + (sarı VEYA yeşil) ikisi birden anlamlı
+    # oranda → bu bir trafik ışığı, üzerinde yanan ışığa göre karar verilir,
+    # tabela değil. DUR komutu yayınlama.
+    if kir_o >= 0.04 and (sar_o >= 0.04 or yes_o >= 0.04):
+        return False
+
+    # Kırmızı baskın ama sarı/yeşil yok → bu kırmızı bir uyarı tabelası.
+    # (dur tabelası, kırmızı kenarlı uyarı vb.) → DUR komutu yayınla.
+    if kir_o >= 0.10:
         return True
 
-    return isik_orani < 0.08
+    # Net karar verilemiyor — şüpheli durum. Yarış güvenliği için DUR.
+    return True
 
 
 def dur_komutu_var_mi(tespitler: list, frame=None, min_alan: int = 0) -> bool:
@@ -283,6 +332,32 @@ def cikmaz_yol_var_mi(tespitler: list) -> bool:
 def park_tabelasi_var_mi(tespitler: list) -> bool:
     """Görev 7 öncesi mavi 'park' tabelası — kırmızı alanı aramaya başla işareti."""
     return sinif_var_mi(tespitler, "park")
+
+
+# ── Sollama yasağı tabelası ─────────────────────────────────────────────────
+# DİKKAT: Bu sınıf mevcut YOLO modelinde (best.pt) YOK.
+# Model sınıf listesi: IsikTabelasi, Tunel, YayaGecidi, dur, durak, forward,
+#   girilmez, iki_yonlu_trafik, ileri_sag_mecburi, ileri_sol_mecburi, ilerisag,
+#   ilerisol, kavsak, kirmizi, park, parkyasak, saga_birlesim, sagadonulmez,
+#   sagdangidiniz, sari, sola_birlesim, soladonulmez, soldangidiniz, turnleft,
+#   turnright, yesil
+#
+# Sollama yasağı tabelasını gerçekten tespit edebilmek için iki seçenek var:
+#   A) Modeli yeniden eğitmek (önerilen):
+#      Eğitim setine 'sollama_yasagi' sınıfı için etiketli görüntüler ekleyip
+#      `yolo train` ile yeni best.pt üretmek.
+#   B) HSV/şekil tabanlı detektör (gorev_dedektor.py'a):
+#      Kırmızı kenarlı yuvarlak içinde iki araç silüeti aramak. Yanlış pozitif
+#      oranı yüksek olur (girilmez ile karışır), yarışta riskli.
+#
+# Şu an için boş bir placeholder bırakıyoruz; model güncellenince bu fonksiyon
+# diğer 'var_mi' fonksiyonları gibi sınıf adıyla doğrudan çalışacak.
+def sollama_yasagi_var_mi(tespitler: list) -> bool:
+    """
+    YOLO model güncellenince 'sollama_yasagi' sınıf adı kontrol edilecek.
+    Model şu an bu sınıfı içermediğinden daima False döner.
+    """
+    return sinif_var_mi(tespitler, "sollama_yasagi")
 
 
 # ── Görev 7: Yerdeki kırmızı park alanını HSV ile bul ──────────────────────
