@@ -41,11 +41,16 @@ echo "  Kullanıcı: $KULLANICI"
 echo "════════════════════════════════════════════════════════════"
 
 # ── 1. Kablosuz bağlantıları kapat (kılavuz 2.3 — diskalifiye nedeni) ────
-echo "[1/4] WiFi ve Bluetooth kapatılıyor..."
-rfkill block wifi      || echo "  uyarı: rfkill wifi başarısız"
-rfkill block bluetooth || echo "  uyarı: rfkill bluetooth başarısız"
-echo "      WiFi/Bluetooth durumu:"
-rfkill list | sed 's/^/      /'
+# YARISMA_GUNU dosyası varsa WiFi/BT kapanır. Yoksa açık kalır (test için).
+if [ -f "$PROJE_DIZINI/YARISMA_GUNU" ]; then
+    echo "[1/4] YARISMA_GUNU dosyası bulundu — WiFi ve Bluetooth kapatılıyor..."
+    rfkill block wifi      || echo "  uyarı: rfkill wifi başarısız"
+    rfkill block bluetooth || echo "  uyarı: rfkill bluetooth başarısız"
+    echo "      WiFi/Bluetooth durumu:"
+    rfkill list | sed 's/^/      /'
+else
+    echo "[1/4] YARISMA_GUNU dosyası YOK — WiFi AÇIK kalıyor (test modu)"
+fi
 
 # ── 2. Sanal ortamı kontrol et ────────────────────────────────────────────
 echo "[2/4] Sanal ortam kontrol ediliyor..."
