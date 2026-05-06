@@ -12,6 +12,8 @@ import cv2
 import time
 import sys
 import os
+import threading
+import queue
 
 # Proje kökünü path'e ekle (başka dizinden çalıştırılırsa da import çalışsın)
 sys.path.insert(0, os.path.dirname(__file__))
@@ -50,11 +52,41 @@ if not cap.isOpened():
     print(f"[HATA] Kamera {KAMERA_INDEX} açılamadı. INDEX'i değiştirmeyi dene.")
     sys.exit(1)
 
+# MJPEG codec — YUYV ham veri Pi USB-2'yi tıkar, MJPEG ~5× daha az bant.
+# Bu satır 5 sn buffer gecikmesinin baş sebeplerinden birini kapatır.
+cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_GENISLIK)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_YUKSEKLIK)
+cap.set(cv2.CAP_PROP_FPS, 30)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-print(f"[KAMERA] {FRAME_GENISLIK}×{FRAME_YUKSEKLIK} @ index={KAMERA_INDEX}")
+print(f"[KAMERA] {FRAME_GENISLIK}×{FRAME_YUKSEKLIK} @ index={KAMERA_INDEX} (MJPEG)")
 print("[BİLGİ]  Çıkmak için 'q' tuşuna bas.\n")
+
+# ── Capture thread: en yeni kareyi tutar, eski kareleri atar ──────────────
+# Önceden ana döngü cap.read()+YOLO yapıyordu; YOLO 200-500 ms sürerken
+# kameradan kare alınmıyor, driver buffer şişip 5 sn'lik gecikme yaratıyordu.
+# Şimdi capture thread sürekli okuyor, ana döngü her zaman EN YENİ kareyi alıyor.
+_frame_kuyrugu: queue.Queue = queue.Queue(maxsize=1)
+_kapaniyor = threading.Event()
+
+
+def _kamera_dongusu():
+    while not _kapaniyor.is_set():
+        ret, f = cap.read()
+        if not ret:
+            time.sleep(0.005)
+            continue
+        if _frame_kuyrugu.full():
+            try:
+                _frame_kuyrugu.get_nowait()
+            except queue.Empty:
+                pass
+        _frame_kuyrugu.put(f)
+
+
+_kamera_thread = threading.Thread(target=_kamera_dongusu, daemon=True)
+_kamera_thread.start()
 
 # ── Durum takibi ───────────────────────────────────────────────────────────
 son_tabela_zamani = 0       # Cooldown için son tepki zamanı
@@ -66,9 +98,10 @@ fps_olcer   = time.time()
 
 # ── Ana döngü ──────────────────────────────────────────────────────────────
 while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("[HATA] Kameradan kare alınamadı.")
+    try:
+        frame = _frame_kuyrugu.get(timeout=2.0)
+    except queue.Empty:
+        print("[HATA] Capture thread'den 2 sn içinde kare gelmedi.")
         break
 
     frame = cv2.resize(frame, (FRAME_GENISLIK, FRAME_YUKSEKLIK))
@@ -160,6 +193,8 @@ while True:
         break
 
 # ── Temizlik ───────────────────────────────────────────────────────────────
+_kapaniyor.set()
+_kamera_thread.join(timeout=1.0)
 cap.release()
 cv2.destroyAllWindows()
 print("\n[BİTİŞ] Test sonlandırıldı.")

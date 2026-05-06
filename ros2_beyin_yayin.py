@@ -161,12 +161,20 @@ class AracBeyniNode(Node):
             self.get_logger().info("Kamera: GStreamer pipeline (Jetson CSI)")
         else:
             self.cap = cv2.VideoCapture(KAMERA_INDEX)
+            # MJPEG codec: USB kameralar default YUYV gönderir, ham 640×480
+            # YUYV ≈ 600 KB/kare → Pi USB-2'de 30 FPS sığmaz, driver kareleri
+            # biriktirip gecikme yaratır. MJPEG ≈ 30-80 KB/kare → tıkanma yok.
+            self.cap.set(cv2.CAP_PROP_FOURCC,
+                         cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_GENISLIK)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_YUKSEKLIK)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
             # Driver kuyruğunu 1 kareye indir → eski/birikmiş kareler atılır,
             # gecikme ~0 olur. V4L2 driver'ı destekliyorsa etkili olur.
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            self.get_logger().info(f"Kamera: V4L2 index={KAMERA_INDEX}")
+            self.get_logger().info(
+                f"Kamera: V4L2 index={KAMERA_INDEX} (MJPEG, 30 FPS, buf=1)"
+            )
 
         if not self.cap.isOpened():
             self.get_logger().fatal("Kamera açılamadı!")
