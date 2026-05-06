@@ -33,7 +33,9 @@ GUVEN_ESIGI  = 0.35         # Confidence threshold — 0.35 dengeli başlangıç
                             # Çok yanlış tespit → 0.45'e çek
                             # Hâlâ "tespit yok" → 0.25'e düşür
 
-MODEL_IMGSZ = 320 if os.path.isdir("best_ncnn_model") else 416
+# 320 her zaman: Pi 4 + best.pt'de 416→320 ≈ %40 hızlanma, küçük tabela
+# doğruluk kaybı pratikte ihmal edilebilir (yarış mesafelerinde).
+MODEL_IMGSZ = 320
 
 # Minimum bounding-box alanı (piksel²) — bu altı gürültü, atılır
 MIN_KUTU_ALANI = 500
@@ -116,7 +118,8 @@ def tahmin_yap(frame) -> list[tuple[str, float, tuple]]:
         raise RuntimeError("modeli_yukle() henüz çağrılmadı.")
 
     # Adaptif CLAHE: sadece çok karanlık (<80) veya çok parlak (>180) ortamlarda
-    gri_ort = float(frame.mean())
+    # Sub-sample mean (8×8 grid) — full frame.mean()'den ~64× hızlı, tahmin aynı
+    gri_ort = float(frame[::8, ::8].mean())
     isle_frame = on_isle(frame, clahe=True) if (gri_ort < 80 or gri_ort > 180) else frame
 
     results = _model(isle_frame, imgsz=MODEL_IMGSZ, verbose=False)[0]

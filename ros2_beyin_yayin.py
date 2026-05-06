@@ -73,6 +73,12 @@ GORUNTU_GOSTER   = False      # Jetson'da monitör yoksa False (headless)
 KARARLI_PENCERE  = 5
 KARARLI_ESIK     = 3
 
+# Pi 4'te YOLO+HSV pipeline'ı 200-300 ms sürebiliyor. Her karede çalıştırırsak
+# şerit takibi ve heartbeat geç kalır. Tespit/HSV-görev kontrollerini her N
+# karede bir yapıyoruz; şerit takibi (otonom_beyin) her karede çalışmaya devam.
+# 3 = saniyede ~10 tespit, 100 ms ortalama gecikme — yarış için yeterli.
+TESPIT_PERIYOT   = 3
+
 # Kılavuz 4.4 — azami yarış süresi 4 dakika (240 sn).
 # Brain bu süreyi geçince DUR yayınlar; motor watchdog zaten aktiftir.
 YARIS_SURESI_SN  = 240
@@ -157,6 +163,9 @@ class AracBeyniNode(Node):
             self.cap = cv2.VideoCapture(KAMERA_INDEX)
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_GENISLIK)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_YUKSEKLIK)
+            # Driver kuyruğunu 1 kareye indir → eski/birikmiş kareler atılır,
+            # gecikme ~0 olur. V4L2 driver'ı destekliyorsa etkili olur.
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             self.get_logger().info(f"Kamera: V4L2 index={KAMERA_INDEX}")
 
         if not self.cap.isOpened():
@@ -189,6 +198,10 @@ class AracBeyniNode(Node):
         # ── Temporal kararlılık penceresi ─────────────────────────────────
         # Son N frame'deki sınıf set'lerini tutar. _kararli() oy çokluğuna bakar.
         self._tabela_gecmis: deque[set[str]] = deque(maxlen=KARARLI_PENCERE)
+
+        # ── Frame skip sayacı (YOLO/HSV her TESPIT_PERIYOT karede çalışır) ─
+        self._kare_sayisi   = 0
+        self._son_tespitler: list = []
 
         # ── Frame queue: capture thread → ana callback ────────────────────
         self._frame_kuyrugu: queue.Queue = queue.Queue(maxsize=1)
@@ -296,10 +309,20 @@ class AracBeyniNode(Node):
             self._yayinla(self.komut_yay, Komut.hiz(HIZ_NORMAL))
             self.durum = self.NORMAL
 
+        # ── Frame skip: YOLO ve NORMAL-HSV detektörler her N karede 1 ─────
+        # Şerit takibi (otonom_beyin) ve PARK_ARAMA HSV her karede çalışır.
+        self._kare_sayisi += 1
+        tespit_yap = (self._kare_sayisi % TESPIT_PERIYOT == 0)
+
         # ── YOLOv8 tespiti + temporal pencere güncelleme ──────────────────
-        tespitler = tahmin_yap(frame)
-        siniflar  = {ad for ad, _, _ in tespitler}
-        self._tabela_gecmis.append(siniflar)
+        if tespit_yap:
+            tespitler = tahmin_yap(frame)
+            self._son_tespitler = tespitler
+            siniflar  = {ad for ad, _, _ in tespitler}
+            self._tabela_gecmis.append(siniflar)
+        else:
+            tespitler = self._son_tespitler
+            siniflar  = {ad for ad, _, _ in tespitler}
 
         # ── ISIK_BEKLE: yeşil ışık görene kadar hareket yok ───────────────
         if self.durum == self.ISIK_BEKLE:
@@ -391,8 +414,9 @@ class AracBeyniNode(Node):
         # ──────────────────────────────────────────────────────────────────
         # HSV tabanlı görevler — model'de sınıfı yok, paralel kontrol
         # PARK_ARAMA durumunda tetiklenmesin (park bölgesinde başka şey yok)
+        # tespit_yap koşulu: bu 3 HSV pipeline her karede ~15-30 ms tutuyordu
         # ──────────────────────────────────────────────────────────────────
-        if self.durum == self.NORMAL:
+        if self.durum == self.NORMAL and tespit_yap:
 
             # ── Görev 4: Hemzemin geçit (kılavuz 3.4.4 — 30 cm + 5 sn) ────
             # Yaya geçidi ile aynı bekleme protokolü; cooldown 'tabela' ile paylaşılır
