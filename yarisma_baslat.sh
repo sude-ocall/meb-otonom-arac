@@ -71,33 +71,14 @@ if [ ! -d "$PROJE_DIZINI/best_ncnn_model" ]; then
     echo "        Hızlandırmak için: yolo export model=best.pt format=ncnn imgsz=320"
 fi
 
-# ── 4. ROS2 node'larını başlat ────────────────────────────────────────────
-echo "[4/4] ROS2 nodları başlatılıyor..."
+# ── 4. Otonom aracı başlat (ROS2'suz tek dosya) ──────────────────────────
+echo "[4/4] Otonom araç başlatılıyor..."
 cd "$PROJE_DIZINI"
-
-# ROS2 ortamını yükle (yoksa)
-if ! command -v ros2 &> /dev/null; then
-    if [ -f /opt/ros/humble/setup.bash ]; then
-        # shellcheck source=/dev/null
-        source /opt/ros/humble/setup.bash
-    else
-        echo "[HATA] ROS2 (humble) bulunamadı: /opt/ros/humble/setup.bash yok."
-        exit 1
-    fi
-fi
 
 PY="$PROJE_DIZINI/.venv/bin/python3"
 
-echo "  → motor_dinleyici (arka plan) başlatılıyor..."
-sudo -E -u "$KULLANICI" "$PY" ros2_motor_dinleyici.py &
-MOTOR_PID=$!
-sleep 2
-
-# Brain Ctrl+C aldığında motor da temiz kapansın
-trap "echo '[BİTİŞ] motor node kapatılıyor...'; kill $MOTOR_PID 2>/dev/null || true" EXIT
-
-echo "  → beyin_yayin (ön plan) başlatılıyor (motor PID=$MOTOR_PID)..."
-sudo -E -u "$KULLANICI" "$PY" ros2_beyin_yayin.py
+echo "  → baslat.py (beyin + motor tek dosya) çalıştırılıyor..."
+sudo -E -u "$KULLANICI" "$PY" baslat.py
 
 echo "════════════════════════════════════════════════════════════"
 echo "  YARIŞMA SONLANDI"
