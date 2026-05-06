@@ -24,7 +24,7 @@ from nesne_beyni import (modeli_yukle, tahmin_yap,
                           yesil_isik_var_mi, dur_komutu_var_mi,
                           cikmaz_yol_var_mi, park_tabelasi_var_mi,
                           kirmizi_park_alani_bul, park_alani_yonu,
-                          YAYA_YAKIN_MIN_ALAN)
+                          sinif_var_mi, YAYA_YAKIN_MIN_ALAN)
 from serit_beyni import otonom_beyin
 from gorev_dedektor import (hiz_tumsek_var_mi, hemzemin_var_mi,
                              turuncu_arac_var_mi)
@@ -420,6 +420,16 @@ class AracBeyni:
                 self.durum = self.NORMAL
             return
 
+        # KIRMIZI IŞIK: yarış sırasında kırmızı ışık görünce dur
+        if self.durum == self.NORMAL and tespit_yap:
+            if sinif_var_mi(tespitler, "kirmizi") and self._kararli("kirmizi"):
+                print(f"{self._t()}KIRMIZI IŞIK — duruldu")
+                self._komut(Komut.DUR)
+                self.durum = self.DUR_BEKLE
+                self.bekleme_bitis = su_an + 5
+                self.son_tabela_zamani = su_an
+                return
+
         # PARK_ARAMA
         if self.durum == self.PARK_ARAMA:
             var, merkez, alan, icinde_mi = kirmizi_park_alani_bul(frame)
@@ -526,12 +536,8 @@ def main():
     print("  MEB OTONOM ARAÇ — TEK DOSYA BAŞLATICI (ROS2'suz)")
     print("════════════════════════════════════════════════════════════")
 
-    # Görev 1: Buton ile başlatma (+50 puan)
-    if buton_kullanilabilir_mi() and buton_hazirla():
-        print("[GÖREV 1] Buton modu — butona basılması bekleniyor...")
-        buton_basildi_mi_bekle()
-    else:
-        print("[GÖREV 1] Buton yok — doğrudan başlatılıyor")
+    # Görev 1: Pil butonu kullanılıyor — GPIO buton bekleme atlanıyor
+    print("[GÖREV 1] Pil butonu kullanılıyor — doğrudan başlatılıyor")
 
     motor = MotorKontrol()
 
